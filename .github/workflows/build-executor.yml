@@ -1,0 +1,109 @@
+# Build the CI job executor image → GHCR.
+#
+# ONE executor image: a Guix System OS + job toolchain (git, .NET, Python,
+# guix, make, curl …). It is NOT a runner — no gitea-runner/act-runner
+# binary inside. A CI system (Gitea Actions / Forgejo / GitHub) runs its
+# runner process elsewhere and executes job steps inside this image, so
+# there are no per-CI variants and no variant tags: one image, one tag.
+#
+# Substitute policy by runner class (this workflow is GitHub-hosted):
+#   - GitHub-hosted runners have NO IPv6 egress and cache01 is AAAA-only,
+#     so a private cache URL there is a connect-timeout per miss, not a
+#     fast fallback (see substitute-cache-garage.md). Use official
+#     substitutes only: ci.guix.gnu.org + bordeaux.
+#   - Self-hosted runners on the fleet substitute cache01 first; the
+#     GUIX_CACHE_URL secret carries that URL for workflows that run there.
+
+name: build-executor
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'executor/**'
+      - '.github/workflows/build-executor.yml'
+  workflow_dispatch:  # manual trigger (version bumps, retries)
+
+permissions:
+  contents: read
+  packages: write  # push to GHCR
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Guix
+        uses: PromyLOPh/guix-install-action@v1
+        with:
+          pullAfterInstall: true
+
+      - name: Configure substitute URLs
+        run: |
+          # GitHub-hosted: official substitutes only (cache01 unreachable —
+          # AAAA-only + no IPv6 egress). The private cache is wired for
+          # self-hosted workflows, not this one.
+          SUBSTITUTE_URLS="https://ci.guix.gnu.org https://bordeaux.guix.gnu.org"
+          # Write to a daemon drop-in: the install action has no
+          # substitute-urls input, and the daemon (not this shell) fetches.
+          sudo mkdir -p /etc/systemd/system/guix-daemon.service.d
+          printf '[Service]\nEnvironment="GUIX_SUBSTITUTE_URLS=%s"\n' "$SUBSTITUTE_URLS" | \
+            sudo tee /etc/systemd/system/guix-daemon.service.d/10-substitute.conf > /dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl restart guix-daemon
+          echo "substitute-urls = $SUBSTITUTE_URLS"
+
+      - name: Authorize official substitute keys
+        run: |
+          # Keys live in share/guix/*.pub (Guix 1.5.0), not etc/substitutes/
+          GUIX_SHARE="$(guix build guix | head -1)/share/guix"
+          for k in berlin bordeaux ci; do
+            if [ -f "$GUIX_SHARE/$k.guix.gnu.org.pub" ]; then
+              guix archive --authorize < "$GUIX_SHARE/$k.guix.gnu.org.pub"
+            else
+              echo "key $k.guix.gnu.org.pub not found in $GUIX_SHARE — continuing"
+            fi
+          done
+
+      - name: Build executor image (docker format)
+        run: |
+          guix system image -t docker \
+            executor/gitea/config.scm \
+            > /tmp/executor.tar.gz
+
+      - name: Verify image
+        run: |
+          ls -lh /tmp/executor.tar.gz
+          gzip -t /tmp/executor.tar.gz
+          # Load and smoke-test: the image must boot Shepherd and carry the
+          # job toolchain (guix/dotnet/python are the load-bearing checks —
+          # podman exec does not load PATH, so resolve absolute paths).
+          podman load < /tmp/executor.tar.gz
+          podman run --rm --entrypoint /run/current-system/profile/bin/guix \
+            localhost/guix:latest --version
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and push to GHCR
+        run: |
+          SRC="localhost/guix:latest"
+          OWNER="${GITHUB_REPOSITORY_OWNER}"
+          DEST="ghcr.io/${OWNER}/reproducible-executors/executor"
+          TAG="${GITHUB_SHA:0:12}"
+          # single image, stable + immutable tags (no per-CI variants)
+          podman tag "$SRC" "$DEST:latest"
+          podman tag "$SRC" "$DEST:${TAG}"
+          podman push "$DEST:latest"
+          podman push "$DEST:${TAG}"
+
+      - name: Image metadata
+        run: |
+          podman inspect "ghcr.io/${GITHUB_REPOSITORY_OWNER}/reproducible-executors/executor:latest" \
+            --format '{{.Size}} bytes'

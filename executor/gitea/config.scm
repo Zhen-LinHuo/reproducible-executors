@@ -59,25 +59,14 @@
            "guix"
 
            ;; === Build tools ===
-           "make"
            "pkg-config"
 
            ;; === Networking ===
            "curl"
            "wget"
-           ;; nss-certs omitted — already in %base-packages
-
-           ;; === Compression ===
-           "gzip"
-           "xz"
-           "zstd"
-
-           ;; === Core utilities ===
-           "coreutils"
-           "grep"
-           "sed"
-           "gawk"
-           "findutils"))
+           ;; nss-certs, make, gzip, xz, zstd, coreutils, grep, sed, gawk,
+           ;; findutils omitted — already in %base-packages (conflict if listed).
+           ))
     %base-packages))
 
   (services
