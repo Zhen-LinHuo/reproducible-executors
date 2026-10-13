@@ -1,0 +1,27 @@
+# Guix build artifacts
+*.tar.gz
+result
+result-*
+
+# Nix build artifacts
+result
+result-*
+.direnv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.venv/
+
+# Agent local instructions (sensitive — never published)
+AGENTS.local.md
