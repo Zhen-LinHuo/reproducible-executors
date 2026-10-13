@@ -1,9 +1,12 @@
-;; Minimal Guix System config — verified: builds via `guix system image -t docker`,
-;; loads with podman, boots Shepherd (PID 1) + openssh + udevd.
-;;
-;; Build:
-;;   guix system image -t docker guix/gitea-runner/config.scm > gitea-runner.tar.gz
-;;   podman load < gitea-runner.tar.gz
+;;; Guix System executor image — single-layer (option A).
+;;;
+;;; OS base + job toolchain baked into ONE image via `guix system image`.
+;;; The toolchain list mirrors manifest.scm (kept as reference + local
+;;; `guix shell -m` use); edit BOTH when changing the toolchain.
+;;;
+;;; Build:
+;;;   guix system image -t docker executor/gitea/config.scm > executor.tar.gz
+;;;   podman load < executor.tar.gz
 
 (use-modules (gnu) (gnu packages))
 (use-service-modules networking ssh)
@@ -34,10 +37,48 @@
                 (home-directory "/home/executor"))
                %base-user-accounts))
 
-  ;; specification->package avoids per-package module imports
-  (packages (append (map specification->package
-                         '("git" "node" "jq" "curl"))
-                    %base-packages))
+  ;; Job toolchain (mirrors manifest.scm — keep both in sync).
+  ;; specification->package avoids per-package module imports.
+  (packages
+   (append
+    (map specification->package
+         '(;; === VCS ===
+           "git"
+           "git-lfs"
+
+           ;; === .NET SDK ===
+           "dotnet"
+
+           ;; === Python ===
+           "python"
+           "python-virtualenv"
+           "python-pip"
+
+           ;; === Guix essentials (guix shell inside jobs) ===
+           "guile"
+           "guix"
+
+           ;; === Build tools ===
+           "make"
+           "pkg-config"
+
+           ;; === Networking ===
+           "curl"
+           "wget"
+           ;; nss-certs omitted — already in %base-packages
+
+           ;; === Compression ===
+           "gzip"
+           "xz"
+           "zstd"
+
+           ;; === Core utilities ===
+           "coreutils"
+           "grep"
+           "sed"
+           "gawk"
+           "findutils"))
+    %base-packages))
 
   (services
    (append
