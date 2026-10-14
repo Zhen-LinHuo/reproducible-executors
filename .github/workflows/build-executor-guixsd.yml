@@ -1,0 +1,138 @@
+# Build the CI job executor image → GHCR, SELF-HOSTED on GuixSD.
+#
+# This is the SELF-BOOTSTRAPPING variant: the job runs INSIDE the GuixSD
+# executor image itself (pulled from GHCR), so the workflow that builds the
+# image also runs on the image it builds. The image provides the Guix toolchain
+# (guix, dotnet, python3, git) that the build steps need — no PromyLOPh action
+# install, no PATH gymnastics, no Guix daemon setup (the image ships the daemon
+# pre-configured).
+#
+# Key differences from the GitHub-hosted variant (build-executor.yml):
+#   1. `runs-on: self-hosted` + `container: ghcr.io/.../executor:latest`
+#   2. No "Install Guix" step — the image IS Guix System, guix is at
+#      /run/current-system/profile/bin/guix (absolute path, no PATH needed)
+#   3. No "Configure substitute URLs" — the image's daemon already has
+#      cache01 + SJTU + official configured (see executor/gitea/config.scm)
+#   4. No "Diagnose guix environment" — the environment IS the image
+#   5. Build step uses the SAME image's guix (self-referential bootstrap)
+#
+# Naming convention: `build-executor-guixsd` distinguishes this from the
+# GitHub-hosted `build-executor` workflow. Both produce the SAME image; the
+# difference is WHERE the job runs.
+
+name: build-executor-guixsd
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'executor/**'
+      - '.guix/**'
+      - '.github/workflows/build-executor-guixsd.yml'
+  workflow_dispatch:  # manual trigger (version bumps, retries)
+
+permissions:
+  contents: read
+  packages: write  # push to GHCR
+
+jobs:
+  build:
+    runs-on: self-hosted
+    container:
+      image: ghcr.io/zhen-linhuo/reproducible-executors/executor-guix:latest
+      # Guix System images need /run writable (activation creates
+      # /run/current-system symlink there at boot) and /tmp writable
+      # (TMPDIR for builds). Podman's default tmpfs mounts cover both.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Diagnose executor environment
+        run: |
+          # The image IS the environment — this step is EVIDENCE, not setup.
+          # If this fails, the image is broken, not the workflow.
+          echo "guix: $(/run/current-system/profile/bin/guix --version 2>&1 | head -1)"
+          echo "dotnet: $(/run/current-system/profile/bin/dotnet --version 2>&1 | head -1)"
+          echo "python3: $(/run/current-system/profile/bin/python3 --version 2>&1 | head -1)"
+          echo "git: $(/run/current-system/profile/bin/git --version 2>&1 | head -1)"
+
+      - name: Build executor image (docker format)
+        run: |
+          # Self-referential bootstrap: use THIS image's guix to build the
+          # image from config.scm. The channel pin (.guix/channels.scm) is
+          # the same as the GitHub-hosted variant — official + nonguix.
+          # The image's daemon already has cache01 + SJTU + official
+          # substitutes configured, so the build pulls from the fastest
+          # available source.
+          # SUBSTITUTE_URLS at BOTH layers (aigate guix-drift shape): the
+          # time-machine layer resolves channels and the inner `system image`
+          # resolves packages, each consulting substitutes independently.
+          # Explicit here rather than trusting the image's daemon config —
+          # a self-hosted runner's host may inject its own daemon settings,
+          # and the workflow must not depend on that ambient state.
+          SUBS="${{ secrets.GUIX_CACHE_URL }} https://mirror.sjtu.edu.cn/guix/ https://ci.guix.gnu.org https://bordeaux.guix.gnu.org"
+          STORE_PATH=$(/run/current-system/profile/bin/guix \
+            time-machine -C .guix/channels.scm \
+            --substitute-urls="$SUBS" -- \
+            system image -t docker --substitute-urls="$SUBS" \
+            executor/gitea/config.scm 2>/dev/null | tail -1)
+          echo "store path: $STORE_PATH"
+          # The store item IS the gzipped docker tarball (~867 MB).
+          [ -f "$STORE_PATH" ] || { echo "FATAL: store path is not a file: '$STORE_PATH'"; exit 1; }
+          case "$STORE_PATH" in
+            *.tar.gz) : ;;
+            *) echo "FATAL: unexpected store item name: $STORE_PATH"; exit 1 ;;
+          esac
+          cp "$STORE_PATH" /tmp/executor.tar.gz
+          ls -lh /tmp/executor.tar.gz
+
+      - name: Verify image
+        run: |
+          ls -lh /tmp/executor.tar.gz
+          gzip -t /tmp/executor.tar.gz
+          # The image's podman is at /run/current-system/profile/bin/podman
+          PODMAN=/run/current-system/profile/bin/podman
+          "$PODMAN" load < /tmp/executor.tar.gz
+          # Boot the image, wait for activation, exec the toolchain by
+          # absolute path (no /bin/sh, no PATH in podman exec — the image
+          # ships neither; skill ci-on-github-actions.md L560-564).
+          "$PODMAN" run -d --name exec-smoke localhost/guix:latest
+          for i in $(seq 1 30); do
+            "$PODMAN" exec exec-smoke /run/current-system/profile/bin/guix --version 2>/dev/null && break
+            sleep 2
+          done
+          "$PODMAN" exec exec-smoke /run/current-system/profile/bin/guix --version
+          "$PODMAN" exec exec-smoke /run/current-system/profile/bin/python3 --version
+          "$PODMAN" exec exec-smoke /run/current-system/profile/bin/dotnet --version
+          "$PODMAN" exec exec-smoke /run/current-system/profile/bin/git --version
+          "$PODMAN" stop exec-smoke && "$PODMAN" rm exec-smoke
+
+      - name: Log in to GHCR
+        run: |
+          # Podman inside the image needs explicit login (no docker/login-action
+          # in a Guix System container — no docker CLI, and the action's
+          # credential helper doesn't resolve here).
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            /run/current-system/profile/bin/podman login ghcr.io \
+            -u "${{ github.actor }}" --password-stdin
+
+      - name: Tag and push to GHCR
+        run: |
+          PODMAN=/run/current-system/profile/bin/podman
+          SRC="localhost/guix:latest"
+          OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          DEST="ghcr.io/${OWNER}/reproducible-executors/executor-guix"
+          VERSION="$(cat executor/gitea/VERSION)"
+          # Three-tag policy: v-semver / latest / sha (traceability).
+          "$PODMAN" tag "$SRC" "$DEST:v${VERSION}"
+          "$PODMAN" tag "$SRC" "$DEST:latest"
+          "$PODMAN" tag "$SRC" "$DEST:sha-${GITHUB_SHA:0:12}"
+          "$PODMAN" push "$DEST:v${VERSION}"
+          "$PODMAN" push "$DEST:latest"
+          "$PODMAN" push "$DEST:sha-${GITHUB_SHA:0:12}"
+
+      - name: Image metadata
+        run: |
+          /run/current-system/profile/bin/podman inspect \
+            "ghcr.io/$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')/reproducible-executors/executor-guix:latest" \
+            --format '{{.Size}} bytes'

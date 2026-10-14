@@ -116,8 +116,14 @@ jobs:
           # a local `--dry-run`: stdout is empty until the real store path is
           # emitted). So: capture that path, then locate the real docker
           # tarball inside the store item.
-          STORE_PATH=$(guix time-machine -C .guix/channels.scm -- \
-            system image -t docker \
+          # SUBSTITUTE_URLS at BOTH layers (aigate guix-drift shape):
+          # time-machine resolves channels AND the inner `system image`
+          # resolves packages — each consults substitutes independently, so
+          # a URL on only one layer leaves the other on daemon defaults.
+          SUBS="${{ secrets.GUIX_CACHE_URL }} https://mirror.sjtu.edu.cn/guix/ https://ci.guix.gnu.org https://bordeaux.guix.gnu.org"
+          STORE_PATH=$(guix time-machine -C .guix/channels.scm \
+            --substitute-urls="$SUBS" -- \
+            system image -t docker --substitute-urls="$SUBS" \
             executor/gitea/config.scm 2>/dev/null | tail -1)
           echo "store path: $STORE_PATH"
           # The store item IS the gzipped docker tarball — a plain FILE
@@ -168,15 +174,19 @@ jobs:
           # (Zhen-LinHuo) carries capitals and is rejected verbatim by
           # `podman push` with "repository name must be lowercase".
           OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          DEST="ghcr.io/${OWNER}/reproducible-executors/executor"
-          TAG="${GITHUB_SHA:0:12}"
-          # single image, stable + immutable tags (no per-CI variants)
+          DEST="ghcr.io/${OWNER}/reproducible-executors/executor-guix"
+          VERSION="$(cat executor/gitea/VERSION)"
+          # Three-tag policy: v-semver (explicit content version, bumped by
+          # editing VERSION), latest (points at the newest vX.Y.Z), and a
+          # sha tag for build traceability. No per-CI variants.
+          podman tag "$SRC" "$DEST:v${VERSION}"
           podman tag "$SRC" "$DEST:latest"
-          podman tag "$SRC" "$DEST:${TAG}"
+          podman tag "$SRC" "$DEST:sha-${GITHUB_SHA:0:12}"
+          podman push "$DEST:v${VERSION}"
           podman push "$DEST:latest"
-          podman push "$DEST:${TAG}"
+          podman push "$DEST:sha-${GITHUB_SHA:0:12}"
 
       - name: Image metadata
         run: |
-          podman inspect "ghcr.io/$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')/reproducible-executors/executor:latest" \
+          podman inspect "ghcr.io/$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')/reproducible-executors/executor-guix:latest" \
             --format '{{.Size}} bytes'
