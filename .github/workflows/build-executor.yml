@@ -28,6 +28,16 @@ permissions:
   contents: read
   packages: write  # push to GHCR
 
+env:
+  # mkstemp: Permission denied fix — the guix-daemon (root) inherits TMPDIR
+  # from the systemctl environment, which points at the runner-owned temp
+  # dir (/home/runner/work/_temp, mode 0700, owned by runner user). Root can
+  # traverse it but cannot create files there (no w+x for other). Setting
+  # TMPDIR=/tmp at job level propagates to all steps AND to daemon commands
+  # invoked via `systemctl set-environment` or `sudo systemctl` (the install
+  # action's daemon unit does NOT pin TMPDIR, so it inherits this).
+  TMPDIR: /tmp
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -42,47 +52,107 @@ jobs:
 
       - name: Configure substitute URLs
         run: |
-          # GitHub-hosted: official substitutes only (cache01 unreachable —
-          # AAAA-only + no IPv6 egress). The private cache is wired for
-          # self-hosted workflows, not this one.
-          SUBSTITUTE_URLS="https://ci.guix.gnu.org https://bordeaux.guix.gnu.org"
+          # Ordered first-hit-wins, private cache FIRST then public mirrors —
+          # the shape aigate's guix-toolchain action settled on. cache01 is
+          # AAAA-only and a GH-hosted runner has no IPv6 egress, so a hit is
+          # unlikely there; a miss falls through to the public mirrors instead
+          # of failing (substitute-urls is consulted in sequence, Guix stops at
+          # the first server that has the item). Cost when unreachable is one
+          # DNS/connect timeout per item, not a job failure.
+          # On a fleet self-hosted runner (with IPv6 via overlay) the private
+          # cache DOES serve and this same list gives the speed win.
+          PUBLIC_URLS="https://mirror.sjtu.edu.cn/guix/ https://ci.guix.gnu.org https://bordeaux.guix.gnu.org"
+          if [ -n "${{ secrets.GUIX_CACHE_URL }}" ]; then
+            SUBSTITUTE_URLS="${{ secrets.GUIX_CACHE_URL }} $PUBLIC_URLS"
+            echo "substitute sources: private cache first, then public mirrors"
+          else
+            SUBSTITUTE_URLS="$PUBLIC_URLS"
+            echo "substitute sources: public mirrors only (no GUIX_CACHE_URL secret)"
+          fi
           # Write to a daemon drop-in: the install action has no
           # substitute-urls input, and the daemon (not this shell) fetches.
+          # TMPDIR: root process in daemon cannot mkstemp in runner-owned
+          # /home/runner/work/_temp (mode 0700) — pin /tmp here so daemon
+          # inherits it regardless of caller env (mkstemp: Permission denied).
           sudo mkdir -p /etc/systemd/system/guix-daemon.service.d
-          printf '[Service]\nEnvironment="GUIX_SUBSTITUTE_URLS=%s"\n' "$SUBSTITUTE_URLS" | \
+          printf '[Service]\nEnvironment="GUIX_SUBSTITUTE_URLS=%s"\nEnvironment="TMPDIR=/tmp"\n' "$SUBSTITUTE_URLS" | \
             sudo tee /etc/systemd/system/guix-daemon.service.d/10-substitute.conf > /dev/null
           sudo systemctl daemon-reload
           sudo systemctl restart guix-daemon
           echo "substitute-urls = $SUBSTITUTE_URLS"
 
-      - name: Authorize official substitute keys
+          # PromyLOPh action installs guix under root's profile but does NOT
+          # put it on the runner's PATH for subsequent steps. GITHUB_PATH is
+          # the official mechanism — same pattern aigate uses (line 166).
+          echo "/var/guix/profiles/per-user/root/current-guix/bin" >> "$GITHUB_PATH"
+          echo "guix path added to GITHUB_PATH for subsequent steps"
+
+      - name: Diagnose guix environment
         run: |
-          # Keys live in share/guix/*.pub (Guix 1.5.0), not etc/substitutes/
-          GUIX_SHARE="$(guix build guix | head -1)/share/guix"
-          for k in berlin bordeaux ci; do
-            if [ -f "$GUIX_SHARE/$k.guix.gnu.org.pub" ]; then
-              guix archive --authorize < "$GUIX_SHARE/$k.guix.gnu.org.pub"
-            else
-              echo "key $k.guix.gnu.org.pub not found in $GUIX_SHARE — continuing"
-            fi
-          done
+          # Evidence for the NEXT failure, not a guess: where guix actually is,
+          # what PATH looks like, and whether GITHUB_PATH from the prior step
+          # landed (this is what would have saved two debug cycles already).
+          echo "which guix: $(command -v guix || echo NOT-IN-PATH)"
+          echo "GITHUB_PATH (prior step writes): $GITHUB_PATH"
+          echo "PATH entries containing guix:"
+          echo "$PATH" | tr ':' '\n' | grep -i guix || echo "  (none)"
+          ls -d /var/guix/profiles/per-user/root/current-guix/bin/guix 2>/dev/null \
+            && echo "root-profile guix: PRESENT" || echo "root-profile guix: MISSING"
 
       - name: Build executor image (docker format)
         run: |
-          guix system image -t docker \
-            executor/gitea/config.scm \
-            > /tmp/executor.tar.gz
+          # OFFICIAL MANUAL (guix time-machine): the command after `--` is a
+          # bare SUBCOMMAND name, never `guix <subcommand>` —
+          #   guix time-machine --commit=v1.2.0 -- environment -C --ad-hoc guile
+          # `guix` there resolves only on the runner PATH, which is why runs
+          # 8-10 died with `guix: command not found` (the extra `guix` word).
+          # `-C .guix/channels.scm` still supplies official + nonguix, so
+          # `dotnet` resolves at build time.
+          #
+          # run12 PROVED the build itself works (step green) — but
+          # `> /tmp/executor.tar.gz` captured only 64 bytes: `guix system
+          # image` WRITES THE IMAGE INTO /gnu/store and prints a one-line
+          # store PATH on stdout (verified against guix 1.5.0's image.scm and
+          # a local `--dry-run`: stdout is empty until the real store path is
+          # emitted). So: capture that path, then locate the real docker
+          # tarball inside the store item.
+          STORE_PATH=$(guix time-machine -C .guix/channels.scm -- \
+            system image -t docker \
+            executor/gitea/config.scm 2>/dev/null | tail -1)
+          echo "store path: $STORE_PATH"
+          # The store item IS the gzipped docker tarball — a plain FILE
+          #   /gnu/store/<hash>-docker-image.tar.gz  (~630 MB; verified as
+          #   the real item shape on the fleet builder, alongside its .drv).
+          # No find needed: searching a file returns nothing (that was run
+          # 13's FATAL). Validate the path is the file itself.
+          [ -f "$STORE_PATH" ] || { echo "FATAL: store path is not a file: '$STORE_PATH'"; exit 1; }
+          case "$STORE_PATH" in
+            *.tar.gz) : ;;
+            *) echo "FATAL: unexpected store item name: $STORE_PATH"; exit 1 ;;
+          esac
+          cp "$STORE_PATH" /tmp/executor.tar.gz
+          ls -lh /tmp/executor.tar.gz
 
       - name: Verify image
         run: |
           ls -lh /tmp/executor.tar.gz
           gzip -t /tmp/executor.tar.gz
-          # Load and smoke-test: the image must boot Shepherd and carry the
-          # job toolchain (guix/dotnet/python are the load-bearing checks —
-          # podman exec does not load PATH, so resolve absolute paths).
           podman load < /tmp/executor.tar.gz
-          podman run --rm --entrypoint /run/current-system/profile/bin/guix \
-            localhost/guix:latest --version
+          # Guix System image: /run/current-system is created by activation
+          # AT BOOT — no /bin/sh, and podman exec needs the boot to finish.
+          # Let the image's own entrypoint boot, wait for activation, then
+          # exec the toolchain by absolute path (skill ci-on-github-actions.md
+          # L560-564: no /bin/sh + podman exec does not load PATH).
+          podman run -d --name exec-smoke localhost/guix:latest
+          for i in $(seq 1 30); do
+            podman exec exec-smoke /run/current-system/profile/bin/guix --version 2>/dev/null && break
+            sleep 2
+          done
+          podman exec exec-smoke /run/current-system/profile/bin/guix --version
+          podman exec exec-smoke /run/current-system/profile/bin/python3 --version
+          podman exec exec-smoke /run/current-system/profile/bin/dotnet --version
+          podman exec exec-smoke /run/current-system/profile/bin/git --version
+          podman stop exec-smoke && podman rm exec-smoke
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -94,7 +164,10 @@ jobs:
       - name: Tag and push to GHCR
         run: |
           SRC="localhost/guix:latest"
-          OWNER="${GITHUB_REPOSITORY_OWNER}"
+          # OCI requires ALL-LOWERCASE repository paths; the GitHub owner
+          # (Zhen-LinHuo) carries capitals and is rejected verbatim by
+          # `podman push` with "repository name must be lowercase".
+          OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           DEST="ghcr.io/${OWNER}/reproducible-executors/executor"
           TAG="${GITHUB_SHA:0:12}"
           # single image, stable + immutable tags (no per-CI variants)
@@ -105,5 +178,5 @@ jobs:
 
       - name: Image metadata
         run: |
-          podman inspect "ghcr.io/${GITHUB_REPOSITORY_OWNER}/reproducible-executors/executor:latest" \
+          podman inspect "ghcr.io/$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')/reproducible-executors/executor:latest" \
             --format '{{.Size}} bytes'
