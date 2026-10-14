@@ -37,7 +37,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     container:
       image: ghcr.io/zhen-linhuo/reproducible-executors/executor-guix:latest
       # Guix System images need /run writable (activation creates
