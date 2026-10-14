@@ -24,7 +24,7 @@ name: build-executor-guixsd
 
 on:
   workflow_run:
-    # Chain after build-executor.yml succeeds — the executor-guix image
+    # Chain after build-executor.yml succeeds — the executor-guixsd image
     # must exist in GHCR BEFORE this job tries to pull it. Push triggers
     # would race the build and fail with "manifest unknown".
     workflows: [build-executor]
@@ -43,7 +43,7 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/zhen-linhuo/reproducible-executors/executor-guix:latest
+      image: ghcr.io/zhen-linhuo/reproducible-executors/executor-guixsd:latest
       # Guix System images need /run writable (activation creates
       # /run/current-system symlink there at boot) and /tmp writable
       # (TMPDIR for builds). Podman's default tmpfs mounts cover both.
@@ -125,7 +125,7 @@ jobs:
           PODMAN=/run/current-system/profile/bin/podman
           SRC="localhost/guix:latest"
           OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          DEST="ghcr.io/${OWNER}/reproducible-executors/executor-guix"
+          DEST="ghcr.io/${OWNER}/reproducible-executors/executor-guixsd"
           VERSION="$(cat executor/gitea/VERSION)"
           # Three-tag policy: v-semver / latest / sha (traceability).
           "$PODMAN" tag "$SRC" "$DEST:v${VERSION}"
@@ -138,5 +138,5 @@ jobs:
       - name: Image metadata
         run: |
           /run/current-system/profile/bin/podman inspect \
-            "ghcr.io/$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')/reproducible-executors/executor-guix:latest" \
+            "ghcr.io/$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')/reproducible-executors/executor-guixsd:latest" \
             --format '{{.Size}} bytes'
