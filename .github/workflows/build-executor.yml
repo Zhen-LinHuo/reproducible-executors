@@ -197,9 +197,22 @@ jobs:
           cat /tmp/binlayer/map.txt
           wc -l < /tmp/binlayer/map.txt
           # Build the new layer: /bin/<tool> -> <store path> symlinks.
+          # Guards (all caught by local testing before this push):
+          #  - empty path → `ln -sf` would create a dangling/blank link
+          #  - a resolved path under /bin → self-referential symlink loop,
+          #    which crun reports as "Too many levels of symbolic links"
+          n=0
           while read -r name path; do
+            [ -n "$name" ] && [ -n "$path" ] || continue
+            case "$path" in /bin/*) echo "SKIP (loop): $name -> $path"; continue ;; esac
             ln -sf "$path" "/tmp/binlayer/bin/$name"
+            n=$((n + 1))
           done < /tmp/binlayer/map.txt
+          echo "links created: $n"
+          [ "$n" -ge 10 ] || { echo "FATAL: only $n links — tool resolution failed"; cat /tmp/binlayer/map.txt; exit 1; }
+          # Hard guarantees for the runner contract.
+          [ -e /tmp/binlayer/bin/tail ] || { echo "FATAL: /bin/tail missing from layer"; exit 1; }
+          [ -e /tmp/binlayer/bin/sh ] || { echo "FATAL: /bin/sh missing from layer"; exit 1; }
           # Append the layer to the existing docker-archive (last layer wins).
           podman build -t localhost/guix:latest -f - /tmp/binlayer <<'DOCKERFILE'
           FROM localhost/guix:latest
@@ -215,11 +228,19 @@ jobs:
           # podman save outputs plain tar (not gzipped); just load it.
           podman load < /tmp/executor.tar.gz
           # Sanity: the injected links must resolve to real store paths.
-          podman run --rm --entrypoint /bin/sh localhost/guix:latest -c \
+          # MUST boot first (own entrypoint) because /bin/sh is created by
+          # activation at boot — --entrypoint skips it (crun: not found).
+          podman run -d --name sanity localhost/guix:latest
+          for i in $(seq 1 30); do
+            podman exec sanity /bin/sh -c 'echo OK' 2>/dev/null && break
+            sleep 2
+          done
+          podman exec sanity /bin/sh -c \
             'for t in sh bash tail head cat grep sed awk find; do
                printf "%-6s -> %s\n" "$t" "$(readlink /bin/$t)"
                "/bin/$t" --version >/dev/null 2>&1 || "/bin/$t" -V >/dev/null 2>&1 || true
              done'
+          podman stop sanity && podman rm sanity
           # GitHub Actions container protocol: the runner boots the container
           # with --entrypoint tail -f /dev/null, then execs steps inside.
           # Emulate that exact contract here.
