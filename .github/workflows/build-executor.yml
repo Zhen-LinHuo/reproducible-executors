@@ -201,7 +201,7 @@ jobs:
       - name: Verify image
         run: |
           ls -lh /tmp/executor.tar.gz
-          gzip -t /tmp/executor.tar.gz
+          # podman save outputs plain tar (not gzipped); just load it.
           podman load < /tmp/executor.tar.gz
           # Sanity: the injected links must resolve to real store paths.
           podman run --rm --entrypoint /bin/sh localhost/guix:latest -c \
