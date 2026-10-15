@@ -180,7 +180,7 @@ jobs:
             podman exec resolve-tools /run/current-system/profile/bin/ls /bin >/dev/null 2>&1 && break
             sleep 2
           done
-          podman exec resolve-tools /run/current-system/profile/bin/sh -c 'for t in sh bash tail head cat ls env sleep cut sort uniq wc tee mkdir rm cp mv ln chmod chown echo printf true false grep sed awk gawk find xargs tar gzip which; do p=$(command -v "$t" 2>/dev/null || true); [ -n "$p" ] && printf "%s %s\n" "$t" "$p"; done' > /tmp/binlayer/map.txt
+          podman exec resolve-tools /run/current-system/profile/bin/sh -c 'for t in sh bash tail head cat ls env sleep cut sort uniq wc tee mkdir rm cp mv ln chmod chown echo printf true false grep sed awk gawk find xargs tar gzip which; do p=$(command -v "$t" 2>/dev/null || true); case "$p" in /bin/*) continue;; esac; [ -n "$p" ] && printf "%s %s\n" "$t" "$p"; done' > /tmp/binlayer/map.txt
           podman stop resolve-tools && podman rm resolve-tools
           echo "=== tools resolved from image ==="
           cat /tmp/binlayer/map.txt
