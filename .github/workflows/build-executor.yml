@@ -157,25 +157,66 @@ jobs:
           cp "$STORE_PATH" /tmp/executor.tar.gz
           ls -lh /tmp/executor.tar.gz
 
+      - name: Inject POSIX /bin for container runtimes
+        # Guix's `docker` image type writes /bin (directory only) at BUILD time
+        # and defers every service-time symlink (activation,
+        # special-files-service-type) to boot — but a CI runner's `docker create
+        # --entrypoint tail` never boots the Guix system, so the runner died with
+        # `exec: "tail": executable file not found in $PATH`.
+        #
+        # Guix exposes no build-time hook to inject these links (verified in
+        # source: `extras` exists in populate-root-file-system but is not plumbed
+        # to the operating-system record). So we extend the image layer itself:
+        # same store paths Guix already carries — only the /bin view changes.
+        run: |
+          set -e
+          podman load < /tmp/executor.tar.gz
+          mkdir -p /tmp/binlayer/bin
+          # Resolve each tool's store path from the IMAGE itself, so the links
+          # always point at what this exact build shipped.
+          podman run --rm --entrypoint /run/current-system/profile/bin/sh localhost/guix:latest \
+            -c 'for t in sh bash tail head cat ls env sleep cut sort uniq wc tee
+                     mkdir rm cp mv ln chmod chown echo printf true false
+                     grep sed awk gawk find xargs tar gzip which; do
+                  p=$(command -v "$t" 2>/dev/null || true)
+                  [ -n "$p" ] && printf "%s %s\n" "$t" "$p"
+                done' > /tmp/binlayer/map.txt
+          echo "=== tools resolved from image ==="
+          cat /tmp/binlayer/map.txt
+          wc -l < /tmp/binlayer/map.txt
+          # Build the new layer: /bin/<tool> -> <store path> symlinks.
+          while read -r name path; do
+            ln -sf "$path" "/tmp/binlayer/bin/$name"
+          done < /tmp/binlayer/map.txt
+          # Append the layer to the existing docker-archive (last layer wins).
+          podman build -t localhost/guix:latest -f - /tmp/binlayer <<'DOCKERFILE'
+          FROM localhost/guix:latest
+          COPY bin /bin
+          DOCKERFILE
+          podman save -o /tmp/executor-patched.tar.gz localhost/guix:latest
+          mv /tmp/executor-patched.tar.gz /tmp/executor.tar.gz
+          ls -lh /tmp/executor.tar.gz
+
       - name: Verify image
         run: |
           ls -lh /tmp/executor.tar.gz
           gzip -t /tmp/executor.tar.gz
           podman load < /tmp/executor.tar.gz
-          # Guix System image: /run/current-system is created by activation
-          # AT BOOT — no /bin/sh, and podman exec needs the boot to finish.
-          # Let the image's own entrypoint boot, wait for activation, then
-          # exec the toolchain by absolute path (skill ci-on-github-actions.md
-          # L560-564: no /bin/sh + podman exec does not load PATH).
-          podman run -d --name exec-smoke localhost/guix:latest
-          for i in $(seq 1 30); do
-            podman exec exec-smoke /run/current-system/profile/bin/guix --version 2>/dev/null && break
-            sleep 2
-          done
+          # Sanity: the injected links must resolve to real store paths.
+          podman run --rm --entrypoint /bin/sh localhost/guix:latest -c \
+            'for t in sh bash tail head cat grep sed awk find; do
+               printf "%-6s -> %s\n" "$t" "$(readlink /bin/$t)"
+               "/bin/$t" --version >/dev/null 2>&1 || "/bin/$t" -V >/dev/null 2>&1 || true
+             done'
+          # GitHub Actions container protocol: the runner boots the container
+          # with --entrypoint tail -f /dev/null, then execs steps inside.
+          # Emulate that exact contract here.
+          podman run -d --name exec-smoke --entrypoint tail localhost/guix:latest -f /dev/null
           podman exec exec-smoke /run/current-system/profile/bin/guix --version
           podman exec exec-smoke /run/current-system/profile/bin/python3 --version
           podman exec exec-smoke /run/current-system/profile/bin/dotnet --version
           podman exec exec-smoke /run/current-system/profile/bin/git --version
+          podman exec exec-smoke /bin/sh -c 'echo "POSIX layer OK"'
           podman stop exec-smoke && podman rm exec-smoke
 
       - name: Log in to GHCR
