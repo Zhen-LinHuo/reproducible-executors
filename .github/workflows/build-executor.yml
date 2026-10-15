@@ -123,14 +123,25 @@ jobs:
           SUBS="${{ secrets.GUIX_CACHE_URL }} https://mirror.sjtu.edu.cn/guix/ https://ci.guix.gnu.org https://bordeaux.guix.gnu.org"
           # substitute-urls on time-machine layer only; inner `system image`
           # inherits daemon config (cache01 + SJTU + official in drop-in).
-          # stderr NOT redirected — let errors surface instead of empty path.
+          # stderr/stdout MUST be split: with `2>&1 | tail -1` the multi-line
+          # guix error collapsed into a single line, was captured as STORE_PATH,
+          # and the `[ -n ]` guard saw it as non-empty — hiding the real
+          # `.drv` build failure entirely (run 38700585418).
+          # Now: stdout (the store path) is captured; stderr streams to the log.
+          set +e
           STORE_PATH=$(guix time-machine -C .guix/channels.scm \
             --substitute-urls="$SUBS" -- \
             system image -t docker \
-            executor/gitea/config.scm 2>&1 | tail -1)
-          echo "STORE_PATH='$STORE_PATH'"
-          # If empty, something above failed — show the last 20 lines for diagnosis
-          [ -n "$STORE_PATH" ] || { echo "=== DIAGNOSIS (last 20 lines) ==="; guix time-machine -C .guix/channels.scm --substitute-urls="$SUBS" -- system image -t docker executor/gitea/config.scm 2>&1 | tail -20; exit 1; }
+            executor/gitea/config.scm 2> >(tee /tmp/guix-build-stderr.log >&2) \
+            | tail -1)
+          GUIX_RC=${PIPESTATUS[0]}
+          set -e
+          echo "STORE_PATH='$STORE_PATH' (rc=$GUIX_RC)"
+          if [ "$GUIX_RC" -ne 0 ] || [ -z "$STORE_PATH" ]; then
+            echo "=== BUILD FAILED (rc=$GUIX_RC) — full guix stderr ==="
+            cat /tmp/guix-build-stderr.log
+            exit 1
+          fi
           echo "store path: $STORE_PATH"
           # The store item IS the gzipped docker tarball — a plain FILE
           #   /gnu/store/<hash>-docker-image.tar.gz  (~630 MB; verified as
@@ -140,7 +151,8 @@ jobs:
           [ -f "$STORE_PATH" ] || { echo "FATAL: store path is not a file: '$STORE_PATH'"; exit 1; }
           case "$STORE_PATH" in
             *.tar.gz) : ;;
-            *) echo "FATAL: unexpected store item name: $STORE_PATH"; exit 1 ;;
+            *) echo "FATAL: unexpected store item name: $STORE_PATH";
+             cat /tmp/guix-build-stderr.log; exit 1 ;;
           esac
           cp "$STORE_PATH" /tmp/executor.tar.gz
           ls -lh /tmp/executor.tar.gz
