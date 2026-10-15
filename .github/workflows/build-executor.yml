@@ -172,15 +172,22 @@ jobs:
           set -e
           podman load < /tmp/executor.tar.gz
           mkdir -p /tmp/binlayer/bin
-          # Resolve each tool's store path from the IMAGE itself, so the links
-          # always point at what this exact build shipped.
-          podman run --rm --entrypoint /run/current-system/profile/bin/sh localhost/guix:latest \
+          # Boot the image's own entrypoint (needed because /run/current-system
+          # is created by activation AT BOOT), then resolve each tool's store
+          # path inside — so links point at what this exact build shipped.
+          podman run -d --name resolve-tools localhost/guix:latest
+          for i in $(seq 1 30); do
+            podman exec resolve-tools /run/current-system/profile/bin/ls /bin >/dev/null 2>&1 && break
+            sleep 2
+          done
+          podman exec resolve-tools /run/current-system/profile/bin/sh \
             -c 'for t in sh bash tail head cat ls env sleep cut sort uniq wc tee
                      mkdir rm cp mv ln chmod chown echo printf true false
                      grep sed awk gawk find xargs tar gzip which; do
                   p=$(command -v "$t" 2>/dev/null || true)
                   [ -n "$p" ] && printf "%s %s\n" "$t" "$p"
                 done' > /tmp/binlayer/map.txt
+          podman stop resolve-tools && podman rm resolve-tools
           echo "=== tools resolved from image ==="
           cat /tmp/binlayer/map.txt
           wc -l < /tmp/binlayer/map.txt
