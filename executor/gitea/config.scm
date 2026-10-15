@@ -81,25 +81,16 @@
      ;; GitHub Actions container protocol: runner expects /bin/sh, /bin/tail
      ;; etc. Guix System keeps everything in /gnu/store + profile bin/ but
      ;; /bin itself is empty — link the POSIX toolchain there.
+     ;; simple-service takes the gexp DIRECTLY as its value — no lambda wrapper.
      (simple-service
       'link-bin-to-posix-tools activation-service-type
-      (lambda ()
-        ;; Create /bin if missing, then symlink core tools from the system
-        ;; profile (which always contains bash/coreutils/grep/sed/findutils).
-        #~(begin
-            (use-modules (ice-9 ftw)
-                         (guix build utils))
-            (mkdir-p "/bin")
-            (for-each
-             (lambda (tool)
-               (let ((src (string-append "/run/current-system/profile/bin/" tool))
-                     (dst (string-append "/bin/" tool)))
-                 (when (file-exists? src)
-                   (unless (file-exists? dst)
-                     (symlink src dst)))))
-             '("sh" "bash" "tail" "head" "cat" "ls" "grep" "sed" "awk" "gawk"
-               "find" "mkdir" "rm" "cp" "mv" "ln" "chmod" "chown" "echo"
-               "printf" "env" "which" "true" "false" "sleep" "cut" "sort"
-               "uniq" "wc" "tee" "xargs" "tar" "gzip" "gunzip")))))))
-
-    %base-services)))
+      #~(system* "/bin/sh" "-c"
+                 (string-append
+                  "mkdir -p /bin; "
+                  "for t in sh bash tail head cat ls grep sed awk gawk find "
+                  "mkdir rm cp mv ln chmod chown echo printf env which true "
+                  "false sleep cut sort uniq wc tee xargs tar gzip gunzip; do "
+                  "src=/run/current-system/profile/bin/$t; "
+                  "[ -e $src ] && [ ! -e /bin/$t ] && ln -s $src /bin/$t; "
+                  "done"))))
+     %base-services)))
