@@ -45,6 +45,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Restore Guix caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/guix
+            /var/guix/profiles
+            /root/.config/guix
+          key: guix-${{ runner.os }}-${{ hashFiles('.guix/channels.scm', 'executor/gitea/config.scm') }}
+          restore-keys: |
+            guix-${{ runner.os }}-
+
       - name: Install Guix
         uses: PromyLOPh/guix-install-action@v1
         with:
