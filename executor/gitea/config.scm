@@ -9,7 +9,7 @@
 ;;;   podman load < executor.tar.gz
 
 (use-modules (gnu) (gnu packages))
-(use-service-modules networking ssh)
+(use-service-modules base networking ssh)
 
 (operating-system
   (host-name "executor")
@@ -78,19 +78,54 @@
                (password-authentication? #f)))
      (service dhcpcd-service-type)
 
-     ;; GitHub Actions container protocol: runner expects /bin/sh, /bin/tail
-     ;; etc. Guix System keeps everything in /gnu/store + profile bin/ but
-     ;; /bin itself is empty — link the POSIX toolchain there.
-     ;; simple-service takes the gexp DIRECTLY as its value — no lambda wrapper.
-     (simple-service
-      'link-bin-to-posix-tools activation-service-type
-      #~(system* "/bin/sh" "-c"
-                 (string-append
-                  "mkdir -p /bin; "
-                  "for t in sh bash tail head cat ls grep sed awk gawk find "
-                  "mkdir rm cp mv ln chmod chown echo printf env which true "
-                  "false sleep cut sort uniq wc tee xargs tar gzip gunzip; do "
-                  "src=/run/current-system/profile/bin/$t; "
-                  "[ -e $src ] && [ ! -e /bin/$t ] && ln -s $src /bin/$t; "
-                  "done"))))
-     %base-services)))
+     ;; GitHub Actions container protocol: the runner's `docker create`
+     ;; hard-codes --entrypoint "tail" (and its init runs sh/cat), so these
+     ;; must exist in /bin.
+     ;;
+     ;; special-files-service-type, NOT activation-service-type: special-files
+     ;; materialises the symlinks into the root file system AT BUILD TIME
+     ;; (same mechanism gnu/system/images/wsl2.scm uses for /bin/sh), while an
+     ;; activation script only runs at VM boot — which a docker container never
+     ;; reaches, so /bin stayed empty and the runner died with
+     ;; `exec: "tail": executable file not found in $PATH`.
+     (service special-files-service-type
+              (map (lambda (pair)
+                     (cons (car pair)
+                           (file-append (apply specification->package
+                                               (list (cdr pair)))
+                                        (string-append "/bin/" (car pair)))))
+                   '(("sh" . "bash")
+                     ("bash" . "bash")
+                     ("tail" . "coreutils")
+                     ("head" . "coreutils")
+                     ("cat" . "coreutils")
+                     ("ls" . "coreutils")
+                     ("env" . "coreutils")
+                     ("sleep" . "coreutils")
+                     ("cut" . "coreutils")
+                     ("sort" . "coreutils")
+                     ("uniq" . "coreutils")
+                     ("wc" . "coreutils")
+                     ("tee" . "coreutils")
+                     ("mkdir" . "coreutils")
+                     ("rm" . "coreutils")
+                     ("cp" . "coreutils")
+                     ("mv" . "coreutils")
+                     ("ln" . "coreutils")
+                     ("chmod" . "coreutils")
+                     ("chown" . "coreutils")
+                     ("echo" . "coreutils")
+                     ("printf" . "coreutils")
+                     ("true" . "coreutils")
+                     ("false" . "coreutils")
+                     ("grep" . "grep")
+                     ("sed" . "sed")
+                     ("awk" . "gawk")
+                     ("gawk" . "gawk")
+                     ("find" . "findutils")
+                     ("xargs" . "findutils")
+                     ("tar" . "tar")
+                     ("gzip" . "gzip")
+                     ("gunzip" . "gzip")
+                     ("which" . "which")))))
+    %base-services)))
