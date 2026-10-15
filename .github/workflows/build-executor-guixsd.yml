@@ -75,10 +75,12 @@ jobs:
           # a self-hosted runner's host may inject its own daemon settings,
           # and the workflow must not depend on that ambient state.
           SUBS="${{ secrets.GUIX_CACHE_URL }} https://mirror.sjtu.edu.cn/guix/ https://ci.guix.gnu.org https://bordeaux.guix.gnu.org"
+          # substitute-urls on time-machine layer only; inner `system image`
+          # inherits the image's daemon config (cache01 + SJTU + official).
           STORE_PATH=$(/run/current-system/profile/bin/guix \
             time-machine -C .guix/channels.scm \
             --substitute-urls="$SUBS" -- \
-            system image -t docker --substitute-urls="$SUBS" \
+            system image -t docker \
             executor/gitea/config.scm 2>/dev/null | tail -1)
           echo "store path: $STORE_PATH"
           # The store item IS the gzipped docker tarball (~867 MB).
