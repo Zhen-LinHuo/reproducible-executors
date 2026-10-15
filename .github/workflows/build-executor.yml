@@ -121,14 +121,16 @@ jobs:
           # resolves packages — each consults substitutes independently, so
           # a URL on only one layer leaves the other on daemon defaults.
           SUBS="${{ secrets.GUIX_CACHE_URL }} https://mirror.sjtu.edu.cn/guix/ https://ci.guix.gnu.org https://bordeaux.guix.gnu.org"
-          # substitute-urls on time-machine layer only (resolves channels);
-          # inner `system image` inherits daemon config (cache01 + SJTU +
-          # official already in daemon drop-in) — passing it on system image
-          # causes "unrecognized option" and empty STORE_PATH.
+          # substitute-urls on time-machine layer only; inner `system image`
+          # inherits daemon config (cache01 + SJTU + official in drop-in).
+          # stderr NOT redirected — let errors surface instead of empty path.
           STORE_PATH=$(guix time-machine -C .guix/channels.scm \
             --substitute-urls="$SUBS" -- \
             system image -t docker \
-            executor/gitea/config.scm 2>/dev/null | tail -1)
+            executor/gitea/config.scm 2>&1 | tail -1)
+          echo "STORE_PATH='$STORE_PATH'"
+          # If empty, something above failed — show the last 20 lines for diagnosis
+          [ -n "$STORE_PATH" ] || { echo "=== DIAGNOSIS (last 20 lines) ==="; guix time-machine -C .guix/channels.scm --substitute-urls="$SUBS" -- system image -t docker executor/gitea/config.scm 2>&1 | tail -20; exit 1; }
           echo "store path: $STORE_PATH"
           # The store item IS the gzipped docker tarball — a plain FILE
           #   /gnu/store/<hash>-docker-image.tar.gz  (~630 MB; verified as
