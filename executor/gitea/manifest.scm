@@ -33,8 +33,22 @@
    "python-virtualenv"
    "python-pip"
 
-   ;; === CI runner runtime (GitHub Actions needs node for JS actions) ===
-   "node"                   ; Node.js 22 — required by actions/checkout etc.
+   ;; === CI runner runtime (the GitHub runner itself, NOT our code) =======
+   ;; Exhaustive from the runner's own behaviour, verified against run
+   ;; 38903972719 logs (its container probes are hard-coded):
+   ;;   sh  - runner probes the OS via `docker exec ... sh -c "cat /etc/*release"`
+   ;;       and executes every `run:` block through a shell. NOTE: there is
+   ;;       no package called "sh" in Guix; bash supplies /bin/sh, so listing
+   ;;       bash alone covers both roles (verified: guix show sh -> not a
+   ;;       package, guix show bash -> 5.2.37).
+   ;;   bash - GitHub's default shell for `run:` blocks is `bash -e {0}`.
+   ;;   node - runs the JS actions (actions/checkout, actions/cache,
+   ;;       docker/login-action); also the runner's own language.
+   ;; Our own workflow commands (cat/cp/curl/grep/head/ls/readlink/sed/
+   ;; seq/sleep/tail/tr/which + guix/podman/gzip) are all covered by
+   ;; coreutils/grep/sed/gzip/guix already listed below — zero gap there.
+   "bash"                   ; /bin/sh + runner default shell
+   "node"                   ; Node.js 22 — JS actions + runner runtime
 
    ;; === Guix essentials (guix shell inside jobs) ===
    "guile"                  ; Guix's Guile (for guix repl/debug)
