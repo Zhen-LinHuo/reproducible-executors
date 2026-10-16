@@ -15,10 +15,18 @@
 ;; this config's packages list needs, or a guix-daemon security advisory
 ;; (fixes land only in rolling).  No schedule.
 
-;; Official Guix channel (the base — provides guix, git, python, etc.)
-%default-channels
+;; Official Guix channel — explicit master URL (NOT %default-channels).
+;; %default-channels inherits the installer's channel config: a 1.5.0
+;; stable tarball resolves to stable's commit, which differs from
+;; bordeaux.guix.gnu.org's master revision -> every substitute misses
+;; -> full bootstrap rebuild (2+ hour stall). Explicit master URL makes
+;; time-machine resolve to bordeaux's revision.
+(list (channel
+        (name 'guix)
+        (url "https://git.guix.gnu.org/guix.git")
+        (branch "master")))
 
-;; ... + nonguix (provides `dotnet` and other non-free packages).
+;; + nonguix (provides `dotnet` and other non-free packages).
 ;; The introduction is nonguix's PGP fingerprint for channel authentication.
 (cons (channel
         (name 'nonguix)
@@ -28,4 +36,7 @@
             "897c1a470da759236cc11798f4e0a5f7d4d59fbc"
             (openpgp-fingerprint
               "2A39 3FFF 68F4 EF7A 3D29  12AF 6F51 20A0 22FB B2D5"))))
-      %default-channels)
+      (channel
+        (name 'guix)
+        (url "https://git.guix.gnu.org/guix.git")
+        (branch "master")))
