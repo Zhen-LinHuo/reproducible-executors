@@ -59,14 +59,18 @@ jobs:
 
       - name: Install Guix
         # Inline installer from ftp.gnu.org (200, stable) — PromyLOPh is
-        # hard-coded to ci.guix.gnu.org which is currently 502. The 1.5.0
-        # stable tarball installs in ~2-3 min. Then `guix pull` to master
-        # channel so the revision matches bordeaux.guix.gnu.org (which serves
-        # substitutes for master, not stable). Without this pull, stable's
-        # revision differs from bordeaux -> every substitute misses -> full
-        # bootstrap chain rebuild (2+ hour stall). The pull itself uses
-        # git.guix.gnu.org (source repo, not the CI farm) so it's unaffected
-        # by the ci.guix 502.
+        # hard-coded to ci.guix.gnu.org which is currently 502 on its
+        # /search endpoint (the tarball URL PromyLOPh uses). The 1.5.0
+        # stable tarball installs in ~2-3 min.
+        #
+        # The last three steps of PromyLOPh are REQUIRED, not optional —
+        # dropping them caused the 2h bootstrap rebuild (run 38855918229,
+        # log: "ACL for archive imports seems to be uninitialized, substitutes
+        # may be unavailable"): without --authorize the client refuses EVERY
+        # substitute regardless of source, and without --generate-key the
+        # daemon has no signing keypair. The channel pin is set in
+        # .guix/channels.scm and resolved by `guix time-machine -C` in the
+        # Build step, so no `guix pull` here.
         run: |
           URL="https://ftp.gnu.org/gnu/guix/guix-binary-1.5.0.x86_64-linux.tar.xz"
           echo "downloading $URL"
@@ -98,6 +102,22 @@ jobs:
           sudo systemctl daemon-reload
           sudo systemctl enable --now gnu-store.mount guix-daemon.service 2>/dev/null || sudo systemctl enable --now guix-daemon.service
           echo "$GUIX_PATH/bin" >> "$GITHUB_PATH"
+          "$GUIX_PATH/bin/guix" --version | head -1
+
+          # === PromyLOPh's "Authorize build farm" + "Generate keys" (restored) ===
+          # 1. Authorize every official substitute-server public key shipped
+          #    in the tarball. Without this the ACL is uninitialized and
+          #    guix-substitute refuses ALL substitutes regardless of source
+          #    (log: "ACL for archive imports seems to be uninitialized") —
+          #    every source then looks like a miss, forcing a source rebuild.
+          for F in "$GUIX_PATH"/share/guix/*.pub; do
+            [ -e "$F" ] || continue
+            echo "authorizing $(basename "$F")"
+            sudo "$GUIX_PATH/bin/guix" archive --authorize < "$F"
+          done
+          # 2. Generate the daemon's signing keypair (PromyLOPh runs this
+          #    unconditionally before the daemon serves anything).
+          sudo "$GUIX_PATH/bin/guix" archive --generate-key
 
       - name: Configure substitute URLs
         run: |
