@@ -57,21 +57,52 @@ jobs:
             guix-${{ runner.os }}-
 
       - name: Install Guix
-        # PromyLOPh installs nightly master (bordeaux cache = same revision
-        # -> full substitute hit -> 44-49 min runs, proven across 6 success
-        # rounds). The 1.5.0 stable tarball from ftp.gnu.org has a DIFFERENT
-        # revision -> every derivation hash differs -> bordeaux 100% miss ->
-        # full bootstrap chain rebuild (guile-bootstrap, binutils-2.20.1a,
-        # gcc-4.9.4, Python-3.5.9) -> 2+ hour stall (runs 38829386958,
-        # 38841396552, 38845818824).
-        #
-        # pullAfterInstall=true pulls %default-channels (master), which
-        # time-machine then pins via .guix/channels.scm. This is NOT waste:
-        # master's bootstrap chain has substitutes on bordeaux, so the 26 min
-        # pull is a prefetch that pays off in the build step.
-        uses: PromyLOPh/guix-install-action@v1
-        with:
-          pullAfterInstall: true
+        # Inline installer from ftp.gnu.org (200, stable) — PromyLOPh is
+        # hard-coded to ci.guix.gnu.org which is currently 502. The 1.5.0
+        # stable tarball installs in ~2-3 min. Then `guix pull` to master
+        # channel so the revision matches bordeaux.guix.gnu.org (which serves
+        # substitutes for master, not stable). Without this pull, stable's
+        # revision differs from bordeaux -> every substitute misses -> full
+        # bootstrap chain rebuild (2+ hour stall). The pull itself uses
+        # git.guix.gnu.org (source repo, not the CI farm) so it's unaffected
+        # by the ci.guix 502.
+        run: |
+          URL="https://ftp.gnu.org/gnu/guix/guix-binary-1.5.0.x86_64-linux.tar.xz"
+          echo "downloading $URL"
+          curl -fSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/guix-binary.tar.xz "$URL"
+          sudo -- tar --extract --file /tmp/guix-binary.tar.xz -C / --no-overwrite-dir
+          sudo -- groupadd --system guixbuild 2>/dev/null || true
+          for i in $(seq -w 1 10); do
+            sudo useradd -g guixbuild -G guixbuild -d /var/empty -s "$(which nologin)" -c "Guix build user $i" --system "guixbuilder${i}" 2>/dev/null || true
+          done
+          export GUIX_PATH=/var/guix/profiles/per-user/root/current-guix
+          sudo cp "$GUIX_PATH/lib/systemd/system/gnu-store.mount" /etc/systemd/system/ 2>/dev/null || true
+          cat <<'EOF' > "${{ runner.temp }}/guix-daemon.service"
+          [Unit]
+          Description=Build daemon for GNU Guix
+
+          [Service]
+          ExecStart=GUIX_PATH_PLACEHOLDER/bin/guix-daemon --build-users-group=guixbuild --discover=yes
+          Environment='GUIX_LOCPATH=/var/guix/profiles/per-user/root/guix-profile/lib/locale' LC_ALL=en_US.utf8
+          OOMPolicy=continue
+          Restart=always
+          TasksMax=8192
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          sudo sed -i "s|GUIX_PATH_PLACEHOLDER|$GUIX_PATH|" "${{ runner.temp }}/guix-daemon.service"
+          sudo cp "${{ runner.temp }}/guix-daemon.service" /etc/systemd/system/
+          sudo chmod 664 /etc/systemd/system/guix-daemon.service
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now gnu-store.mount guix-daemon.service 2>/dev/null || sudo systemctl enable --now guix-daemon.service
+          echo "$GUIX_PATH/bin" >> "$GITHUB_PATH"
+          "$GUIX_PATH/bin/guix" --version | head -1
+          # KEY: pull master channel so revision matches bordeaux substitute cache
+          echo "=== guix pull to master (matches bordeaux revision) ==="
+          sudo -E env PATH="$GUIX_PATH/bin:$PATH" GUIX_LOCPATH=/var/guix/profiles/per-user/root/guix-profile/lib/locale             guix pull --url=https://git.guix.gnu.org/guix.git 2>&1 | tail -5
+          echo "=== guix describe (revision check) ==="
+          sudo -E env PATH="$GUIX_PATH/bin:$PATH" GUIX_LOCPATH=/var/guix/profiles/per-user/root/guix-profile/lib/locale             guix describe 2>&1 | tail -5
 
       - name: Configure substitute URLs
         run: |
