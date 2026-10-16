@@ -102,28 +102,19 @@ jobs:
 
       - name: Configure substitute URLs
         run: |
-          # Ordered first-hit-wins, private cache FIRST then public mirrors —
-          # the shape aigate's guix-toolchain action settled on. cache01 is
-          # AAAA-only and a GH-hosted runner has no IPv6 egress, so a hit is
-          # unlikely there; a miss falls through to the public mirrors instead
-          # of failing (substitute-urls is consulted in sequence, Guix stops at
-          # the first server that has the item). Cost when unreachable is one
-          # DNS/connect timeout per item, not a job failure.
-          # On a fleet self-hosted runner (with IPv6 via overlay) the private
-          # cache DOES serve and this same list gives the speed win.
-          PUBLIC_URLS="https://mirror.sjtu.edu.cn/guix/ https://ci.guix.gnu.org https://bordeaux.guix.gnu.org"
-          if [ -n "${{ secrets.GUIX_CACHE_URL }}" ]; then
-            SUBSTITUTE_URLS="${{ secrets.GUIX_CACHE_URL }} $PUBLIC_URLS"
-            echo "substitute sources: private cache first, then public mirrors"
-          else
-            SUBSTITUTE_URLS="$PUBLIC_URLS"
-            echo "substitute sources: public mirrors only (no GUIX_CACHE_URL secret)"
-          fi
-          # Write to a daemon drop-in: the install action has no
-          # substitute-urls input, and the daemon (not this shell) fetches.
+          # Written to a daemon drop-in (the daemon, not this shell, fetches
+          # substitutes). Bordeaux only — reasoning in the Build step below.
           # TMPDIR: root process in daemon cannot mkstemp in runner-owned
           # /home/runner/work/_temp (mode 0700) — pin /tmp here so daemon
           # inherits it regardless of caller env (mkstemp: Permission denied).
+          # Bordeaux only: ci.guix 502, SJTU unreachable (000), cache01
+          # AAAA-only (no IPv6 on GH runners). Guix consults sources in
+          # order and waits for each timeout, so dead sources cost minutes
+          # per narinfo query before any hit, then a full source build when
+          # nonguix packages (dotnet/mono) miss. Bordeaux is the stable
+          # official overseas farm (verified 200).
+          SUBSTITUTE_URLS="https://bordeaux.guix.gnu.org"
+          echo "substitute sources: bordeaux (official overseas farm)"
           sudo mkdir -p /etc/systemd/system/guix-daemon.service.d
           printf '[Service]\nEnvironment="GUIX_SUBSTITUTE_URLS=%s"\nEnvironment="TMPDIR=/tmp"\n' "$SUBSTITUTE_URLS" | \
             sudo tee /etc/systemd/system/guix-daemon.service.d/10-substitute.conf > /dev/null
@@ -168,7 +159,13 @@ jobs:
         # time-machine only: the inner pack takes no --substitute-urls.
         # stdout/stderr split so the real build error is never swallowed.
         run: |
-          SUBS="${{ secrets.GUIX_CACHE_URL }} https://mirror.sjtu.edu.cn/guix/ https://ci.guix.gnu.org https://bordeaux.guix.gnu.org"
+          # Bordeaux only: the other sources either 502 (ci.guix), time out
+          # (SJTU 000, cache01 AAAA-only with no IPv6 on GH runners), or are
+          # unreachable. Guix consults sources in order and waits for each
+          # timeout — four dead sources meant minutes of narinfo queries before
+          # any hit, then a full source build when dotnet/mono (nonguix) missed.
+          # Bordeaux is the stable official overseas farm (verified 200).
+          SUBS="https://bordeaux.guix.gnu.org"
           set +e
           STORE_PATH=$(guix time-machine -C .guix/channels.scm \
             --substitute-urls="$SUBS" -- \
