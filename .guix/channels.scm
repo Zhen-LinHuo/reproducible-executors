@@ -6,35 +6,40 @@
 ;; stable tarball's %default-channels = stable's commit), and packages from
 ;; non-official channels fail with "unknown package".
 ;;
-;; Why an EXPLICIT master URL instead of %default-channels: bordeaux
-;; .guix.gnu.org serves substitutes built from the Guix MASTER branch. The
-;; 1.5.0 stable tarball's %default-channels resolves to stable's commit, a
-;; different revision -> every derivation hash differs -> bordeaux 100%
-;; miss -> full bootstrap chain rebuild from seed (2+ hour stall).
-;; time-machine resolving this file against master hits bordeaux instead.
+;; Why PIN A COMMIT instead of (branch "master"): bordeaux.guix.gnu.org is
+;; the official Guix build farm and serves substitutes for exactly ONE
+;; revision of master at a time.  Following the moving branch HEAD means our
+;; derivation hashes are always from a different moment than bordeaux's, so
+;; every .narinfo comes back empty (verified: 4 sources answered 200 with
+;; zero hits) and guix falls back to rebuilding the bootstrap chain from
+;; seed — a 2h+ stall per run.
+;;
+;; fc3d77383da1fd87e40a5e35a41786a095080aec is the revision the Guix QA
+;; service (qa.guix.gnu.org/branch/master) reports as built, with 99.1%
+;; substitute availability on x86_64-linux.  Verified directly: narinfo
+;; lookups against bordeaux for packages from this revision return 200.
+;; NOTE: release tags (v1.5.0 etc.) are NOT an option here — bordeaux
+;; serves substitutes for branch revisions, not for release tags, and QA
+;; has no tag/release view (endpoints 404).
+;;
+;; Single official channel only: nonguix used to live here for `dotnet`,
+;; but the executor image is toolchain-agnostic now (project toolchains are
+;; loaded by each project's own scm at CI runtime), and bordeaux does not
+;; serve nonguix's derivations — keeping it would reintroduce cache misses.
 ;;
 ;; Why pin at all: reproducibility.  `guix time-machine -C <file>` resolves
 ;; this pin to a checkout under ~/.cache/guix; the checkout is what
 ;; actions/cache restores (key = hash of THIS file).
 ;;
-;; Bump policy: EVENT-DRIVEN ONLY — when upstream renames/removes something
-;; this config's packages list needs, or a guix-daemon security advisory
-;; (fixes land only in rolling).  No schedule.
+;; Bump policy: EVENT-DRIVEN ONLY — when bordeaux moves to a new revision
+;; and this one ages out, or upstream renames/removes something this
+;; config's packages list needs.  To find the current revision, read the
+;; revision hash from qa.guix.gnu.org/branch/master and confirm the
+;; narinfo answers on bordeaux before changing it.  No schedule.
 
 (list
  ;; Official Guix channel — provides guix, git, python, etc.
  (channel
   (name 'guix)
   (url "https://git.guix.gnu.org/guix.git")
-  (branch "master"))
-
- ;; nonguix — non-free packages.
- ;; The introduction is nonguix's PGP fingerprint for channel authentication.
- (channel
-  (name 'nonguix)
-  (url "https://gitlab.com/nonguix/nonguix")
-  (introduction
-   (make-channel-introduction
-    "897c1a470da759236cc11798f4e0a5f7d4d59fbc"
-    (openpgp-fingerprint
-     "2A39 3FFF 68F4 EF7A 3D29  12AF 6F51 20A0 22FB B2D5")))))
+  (commit "fc3d77383da1fd87e40a5e35a41786a095080aec")))

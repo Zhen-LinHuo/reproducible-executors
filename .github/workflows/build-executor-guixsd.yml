@@ -63,7 +63,8 @@ jobs:
         run: |
           # Self-referential bootstrap: use THIS image's guix to build the
           # image from config.scm. The channel pin (.guix/channels.scm) is
-          # the same as the GitHub-hosted variant — official + nonguix.
+          # the same as the GitHub-hosted variant — the official channel,
+          # pinned to the bordeaux-built revision.
           # The image's daemon already has cache01 + SJTU + official
           # substitutes configured, so the build pulls from the fastest
           # available source.
