@@ -33,6 +33,9 @@
    "python-virtualenv"
    "python-pip"
 
+   ;; === CI runner runtime (GitHub Actions needs node for JS actions) ===
+   "node"                   ; Node.js 22 — required by actions/checkout etc.
+
    ;; === Guix essentials (guix shell inside jobs) ===
    "guile"                  ; Guix's Guile (for guix repl/debug)
    "guix"                   ; guix CLI (for guix shell -m ...)
