@@ -103,28 +103,31 @@ jobs:
       - name: Configure substitute URLs
         run: |
           # Written to a daemon drop-in (the daemon, not this shell, fetches
-          # substitutes). Bordeaux only — reasoning in the Build step below.
+          # substitutes).
           # TMPDIR: root process in daemon cannot mkstemp in runner-owned
           # /home/runner/work/_temp (mode 0700) — pin /tmp here so daemon
           # inherits it regardless of caller env (mkstemp: Permission denied).
-          # Bordeaux only: ci.guix 502, SJTU unreachable (000), cache01
-          # AAAA-only (no IPv6 on GH runners). Guix consults sources in
-          # order and waits for each timeout, so dead sources cost minutes
-          # per narinfo query before any hit, then a full source build when
-          # nonguix packages (dotnet/mono) miss. Bordeaux is the stable
-          # official overseas farm (verified 200).
-          SUBSTITUTE_URLS="https://bordeaux.guix.gnu.org"
-          echo "substitute sources: bordeaux (official overseas farm)"
+          # Substitute sources — LAYERED first-hit, all sources KEPT (for query
+          # and future push). Bordeaux first (only reliable public farm right
+          # now; ci.guix 502, SJTU 000 would cost a timeout per query). Private
+          # cache01 kept second — served on fleet runners with IPv6, and the
+          # target for future cache populate. Dead sources are only consulted
+          # AFTER bordeaux misses an item.
+          SUBS="https://bordeaux.guix.gnu.org"
+          if [ -n "${{ secrets.GUIX_CACHE_URL }}" ]; then
+            SUBS="$SUBS ${{ secrets.GUIX_CACHE_URL }}"
+          fi
+          SUBS="$SUBS https://ci.guix.gnu.org https://mirror.sjtu.edu.cn/guix/"
+          echo "substitute-urls = $SUBS"
           sudo mkdir -p /etc/systemd/system/guix-daemon.service.d
-          printf '[Service]\nEnvironment="GUIX_SUBSTITUTE_URLS=%s"\nEnvironment="TMPDIR=/tmp"\n' "$SUBSTITUTE_URLS" | \
+          printf '[Service]\nEnvironment="GUIX_SUBSTITUTE_URLS=%s"\nEnvironment="TMPDIR=/tmp"\n' "$SUBS" | \
             sudo tee /etc/systemd/system/guix-daemon.service.d/10-substitute.conf > /dev/null
           sudo systemctl daemon-reload
           sudo systemctl restart guix-daemon
-          echo "substitute-urls = $SUBSTITUTE_URLS"
+          echo "substitute-urls = $SUBS"
 
-          # PromyLOPh action installs guix under root's profile but does NOT
-          # put it on the runner's PATH for subsequent steps. GITHUB_PATH is
-          # the official mechanism — same pattern aigate uses (line 166).
+          # Our inline installer puts guix under root's profile; add it to the
+          # runner's PATH for subsequent steps via GITHUB_PATH (official mech).
           echo "/var/guix/profiles/per-user/root/current-guix/bin" >> "$GITHUB_PATH"
           echo "guix path added to GITHUB_PATH for subsequent steps"
 
@@ -159,13 +162,21 @@ jobs:
         # time-machine only: the inner pack takes no --substitute-urls.
         # stdout/stderr split so the real build error is never swallowed.
         run: |
-          # Bordeaux only: the other sources either 502 (ci.guix), time out
-          # (SJTU 000, cache01 AAAA-only with no IPv6 on GH runners), or are
-          # unreachable. Guix consults sources in order and waits for each
-          # timeout — four dead sources meant minutes of narinfo queries before
-          # any hit, then a full source build when dotnet/mono (nonguix) missed.
-          # Bordeaux is the stable official overseas farm (verified 200).
+          # Substitute sources — LAYERED first-hit, all sources KEPT (per design
+          # decision: preserve our caches for query and future push):
+          #   1. bordeaux  — only reliable public farm right now (verified 200).
+          #                  ci.guix is 502, SJTU is 000 — putting them first
+          #                  costs a timeout PER narinfo query.
+          #   2. private cache01 (GUIX_CACHE_URL) — kept for query on fleet
+          #                  runners (IPv6 overlay) and for FUTURE push/populate.
+          #   3. remaining public mirrors — kept as fallback for later.
+          # Guix consults in order and stops at first hit, so a dead source is
+          # only ever consulted AFTER bordeaux misses an item.
           SUBS="https://bordeaux.guix.gnu.org"
+          if [ -n "${{ secrets.GUIX_CACHE_URL }}" ]; then
+            SUBS="$SUBS ${{ secrets.GUIX_CACHE_URL }}"
+          fi
+          SUBS="$SUBS https://ci.guix.gnu.org https://mirror.sjtu.edu.cn/guix/"
           set +e
           STORE_PATH=$(guix time-machine -C .guix/channels.scm \
             --substitute-urls="$SUBS" -- \
