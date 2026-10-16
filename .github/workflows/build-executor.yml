@@ -97,12 +97,6 @@ jobs:
           sudo systemctl daemon-reload
           sudo systemctl enable --now gnu-store.mount guix-daemon.service 2>/dev/null || sudo systemctl enable --now guix-daemon.service
           echo "$GUIX_PATH/bin" >> "$GITHUB_PATH"
-          "$GUIX_PATH/bin/guix" --version | head -1
-          # KEY: pull master channel so revision matches bordeaux substitute cache
-          echo "=== guix pull to master (matches bordeaux revision) ==="
-          sudo -E env PATH="$GUIX_PATH/bin:$PATH" GUIX_LOCPATH=/var/guix/profiles/per-user/root/guix-profile/lib/locale             guix pull --url=https://git.guix.gnu.org/guix.git 2>&1 | tail -5
-          echo "=== guix describe (revision check) ==="
-          sudo -E env PATH="$GUIX_PATH/bin:$PATH" GUIX_LOCPATH=/var/guix/profiles/per-user/root/guix-profile/lib/locale             guix describe 2>&1 | tail -5
 
       - name: Configure substitute URLs
         run: |
