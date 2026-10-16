@@ -21,6 +21,7 @@ on:
     branches: [main]
     paths:
       - 'executor/**'
+      - '.guix/**'          # channel pins — changing them changes the build
       - '.github/workflows/build-executor.yml'
   workflow_dispatch:  # manual trigger (version bumps, retries)
 
