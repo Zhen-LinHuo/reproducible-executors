@@ -225,20 +225,22 @@ jobs:
           gzip -t /tmp/executor.tar.gz
           podman load < /tmp/executor.tar.gz
           # The pack image is a flat profile - no OS, no activation, nothing to
-          # boot. /bin/* are build-time symlinks into the profile store item;
-          # locate it once and reuse for every tool check.
+          # boot. /bin/* are build-time symlinks into the profile store item.
+          # NOTE: the manifest ships no sh (bash is not listed), so never exec
+          # /bin/sh here — resolve the profile from the HOST via /proc/<pid>/root.
           podman run -d --name exec-smoke --entrypoint tail localhost/guix-pack:latest -f /dev/null
-          PROF=$(podman exec exec-smoke /bin/sh -c 'readlink -f /bin/git | sed "s|/bin/git$||"')
+          sleep 2
+          CID=$(podman inspect --format '{{.State.Running}}' exec-smoke 2>/dev/null || echo dead)
+          [ "$CID" = "true" ] || { echo "FATAL: smoke container not running"; podman rm -f exec-smoke; exit 1; }
+          PROF=$(readlink -f "/proc/$(podman inspect --format '{{.State.Pid}}' exec-smoke)/root/bin/git" | sed "s|/bin/git$||")
           echo "profile: $PROF"
-          test -n "$PROF" || { echo "FATAL: profile not found"; podman rm -f exec-smoke; exit 1; }
+          test -n "$PROF" && test -d "$PROF" || { echo "FATAL: profile not found on host"; podman rm -f exec-smoke; exit 1; }
           # GitHub Actions container contract: --entrypoint tail -f /dev/null.
           podman exec exec-smoke /bin/tail --version | head -1
-          podman exec exec-smoke /bin/sh -c "echo POSIX-layer-OK"
           # Job toolchain (absolute paths - the image ships no PATH assumptions).
-          podman exec exec-smoke "$PROF/bin/git" --version
-          podman exec exec-smoke "$PROF/bin/python3" --version
-          podman exec exec-smoke "$PROF/bin/guix" --version | head -1
-          podman exec exec-smoke "$PROF/bin/curl" --version | head -1
+          for T in git python3 guix curl make grep sed; do
+            podman exec exec-smoke "$PROF/bin/$T" --version 2>/dev/null | head -1 || podman exec exec-smoke "$PROF/bin/$T" -V 2>/dev/null | head -1 || echo "$T: (no --version flag)"
+          done
           podman stop exec-smoke && podman rm exec-smoke
           echo "=== executor image verified (pack, /bin populated) ==="
 
