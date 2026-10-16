@@ -4,8 +4,7 @@
 ;; GitHub-hosted executor image build resolves against.  Without this file,
 ;; `guix time-machine` runs against the INSTALLER's default channels (the
 ;; stable tarball's %default-channels = stable's commit), and packages from
-;; non-official channels (e.g. `dotnet` from nonguix) fail with "unknown
-;; package".
+;; non-official channels fail with "unknown package".
 ;;
 ;; Why an EXPLICIT master URL instead of %default-channels: bordeaux
 ;; .guix.gnu.org serves substitutes built from the Guix MASTER branch. The
@@ -29,7 +28,7 @@
   (url "https://git.guix.gnu.org/guix.git")
   (branch "master"))
 
- ;; nonguix — provides `dotnet` and other non-free packages.
+ ;; nonguix — non-free packages.
  ;; The introduction is nonguix's PGP fingerprint for channel authentication.
  (channel
   (name 'nonguix)

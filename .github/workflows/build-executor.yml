@@ -154,10 +154,10 @@ jobs:
         # Actions hard-codes --entrypoint tail, which never boots the system
         # - so the runner died with exec: "tail": not found and nine rounds of
         # /bin injection all failed. -S /bin=bin is the manual own remedy: it
-        # symlinks the profile bin/ (which contains tail, cat, git, dotnet etc.
+        # symlinks the profile bin/ (which contains tail, cat, git etc.
         # from manifest.scm) into /bin, at BUILD time.
         #
-        # -C .guix/channels.scm pins official + nonguix (dotnet is nonguix).
+        # -C .guix/channels.scm pins the channel set.
         # time-machine only: the inner pack takes no --substitute-urls.
         # stdout/stderr split so the real build error is never swallowed.
         run: |
@@ -217,7 +217,6 @@ jobs:
           # Job toolchain (absolute paths - the image ships no PATH assumptions).
           podman exec exec-smoke "$PROF/bin/git" --version
           podman exec exec-smoke "$PROF/bin/python3" --version
-          podman exec exec-smoke "$PROF/bin/dotnet" --version
           podman exec exec-smoke "$PROF/bin/guix" --version | head -1
           podman exec exec-smoke "$PROF/bin/curl" --version | head -1
           podman stop exec-smoke && podman rm exec-smoke

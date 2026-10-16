@@ -47,9 +47,6 @@
            "git"
            "git-lfs"
 
-           ;; === .NET SDK ===
-           "dotnet"
-
            ;; === Python ===
            "python"
            "python-virtualenv"

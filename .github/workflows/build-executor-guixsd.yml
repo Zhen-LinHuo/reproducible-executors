@@ -3,7 +3,7 @@
 # This is the SELF-BOOTSTRAPPING variant: the job runs INSIDE the GuixSD
 # executor image itself (pulled from GHCR), so the workflow that builds the
 # image also runs on the image it builds. The image provides the Guix toolchain
-# (guix, dotnet, python3, git) that the build steps need — no PromyLOPh action
+# (guix, python3, git) that the build steps need — no PromyLOPh action
 # install, no PATH gymnastics, no Guix daemon setup (the image ships the daemon
 # pre-configured).
 #
@@ -56,7 +56,6 @@ jobs:
           # The image IS the environment — this step is EVIDENCE, not setup.
           # If this fails, the image is broken, not the workflow.
           echo "guix: $(/run/current-system/profile/bin/guix --version 2>&1 | head -1)"
-          echo "dotnet: $(/run/current-system/profile/bin/dotnet --version 2>&1 | head -1)"
           echo "python3: $(/run/current-system/profile/bin/python3 --version 2>&1 | head -1)"
           echo "git: $(/run/current-system/profile/bin/git --version 2>&1 | head -1)"
 
@@ -109,7 +108,6 @@ jobs:
           done
           "$PODMAN" exec exec-smoke /run/current-system/profile/bin/guix --version
           "$PODMAN" exec exec-smoke /run/current-system/profile/bin/python3 --version
-          "$PODMAN" exec exec-smoke /run/current-system/profile/bin/dotnet --version
           "$PODMAN" exec exec-smoke /run/current-system/profile/bin/git --version
           "$PODMAN" stop exec-smoke && "$PODMAN" rm exec-smoke
 

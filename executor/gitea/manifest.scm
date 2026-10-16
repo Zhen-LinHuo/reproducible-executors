@@ -11,7 +11,6 @@
              (gnu packages version-control)
              (gnu packages python)
              (gnu packages python-xyz)
-             (gnu packages dotnet)
              (gnu packages guile)
              (gnu packages bash)
              (gnu packages base)
@@ -28,8 +27,6 @@
    "git"
    "git-lfs"
 
-   ;; === .NET SDK (for dotnet test/build) ===
-   "dotnet"                 ; .NET SDK (nonguix channel provides 10.0.401)
 
    ;; === Python (for data pipeline) ===
    "python"
