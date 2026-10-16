@@ -110,41 +110,32 @@ jobs:
           ls -d /var/guix/profiles/per-user/root/current-guix/bin/guix 2>/dev/null \
             && echo "root-profile guix: PRESENT" || echo "root-profile guix: MISSING"
 
-      - name: Build executor image (docker format)
+      - name: Build executor image (guix pack, docker format)
+        # Guix manual 7.3 "Invoking guix pack" — the OFFICIAL docker path:
+        #   guix pack -f docker -S /bin=bin <pkgs>
+        # produces a Docker-Spec tarball loadable by docker load, and it is
+        # bit-reproducible.
+        #
+        # Why pack, not guix system image -t docker: the OS image ships an
+        # EMPTY /bin (only /bin/sh, created at boot by activation). Guix exposes
+        # no build-time hook to add links (verified in source), and GitHub
+        # Actions hard-codes --entrypoint tail, which never boots the system
+        # - so the runner died with exec: "tail": not found and nine rounds of
+        # /bin injection all failed. -S /bin=bin is the manual own remedy: it
+        # symlinks the profile bin/ (which contains tail, cat, git, dotnet etc.
+        # from manifest.scm) into /bin, at BUILD time.
+        #
+        # -C .guix/channels.scm pins official + nonguix (dotnet is nonguix).
+        # time-machine only: the inner pack takes no --substitute-urls.
+        # stdout/stderr split so the real build error is never swallowed.
         run: |
-          # OFFICIAL MANUAL (guix time-machine): the command after `--` is a
-          # bare SUBCOMMAND name, never `guix <subcommand>` —
-          #   guix time-machine --commit=v1.2.0 -- environment -C --ad-hoc guile
-          # `guix` there resolves only on the runner PATH, which is why runs
-          # 8-10 died with `guix: command not found` (the extra `guix` word).
-          # `-C .guix/channels.scm` still supplies official + nonguix, so
-          # `dotnet` resolves at build time.
-          #
-          # run12 PROVED the build itself works (step green) — but
-          # `> /tmp/executor.tar.gz` captured only 64 bytes: `guix system
-          # image` WRITES THE IMAGE INTO /gnu/store and prints a one-line
-          # store PATH on stdout (verified against guix 1.5.0's image.scm and
-          # a local `--dry-run`: stdout is empty until the real store path is
-          # emitted). So: capture that path, then locate the real docker
-          # tarball inside the store item.
-          # SUBSTITUTE_URLS at BOTH layers (aigate guix-drift shape):
-          # time-machine resolves channels AND the inner `system image`
-          # resolves packages — each consults substitutes independently, so
-          # a URL on only one layer leaves the other on daemon defaults.
           SUBS="${{ secrets.GUIX_CACHE_URL }} https://mirror.sjtu.edu.cn/guix/ https://ci.guix.gnu.org https://bordeaux.guix.gnu.org"
-          # substitute-urls on time-machine layer only; inner `system image`
-          # inherits daemon config (cache01 + SJTU + official in drop-in).
-          # stderr/stdout MUST be split: with `2>&1 | tail -1` the multi-line
-          # guix error collapsed into a single line, was captured as STORE_PATH,
-          # and the `[ -n ]` guard saw it as non-empty — hiding the real
-          # `.drv` build failure entirely (run 38700585418).
-          # Now: stdout (the store path) is captured; stderr streams to the log.
           set +e
           STORE_PATH=$(guix time-machine -C .guix/channels.scm \
             --substitute-urls="$SUBS" -- \
-            system image -t docker \
-            executor/gitea/config.scm 2> >(tee /tmp/guix-build-stderr.log >&2) \
-            | tail -1)
+            pack -f docker -S /bin=bin --image-tag=guix-pack \
+            -m executor/gitea/manifest.scm \
+            2> >(tee /tmp/guix-build-stderr.log >&2) | tail -1)
           GUIX_RC=${PIPESTATUS[0]}
           set -e
           echo "STORE_PATH='$STORE_PATH' (rc=$GUIX_RC)"
@@ -153,107 +144,38 @@ jobs:
             cat /tmp/guix-build-stderr.log
             exit 1
           fi
-          echo "store path: $STORE_PATH"
-          # The store item IS the gzipped docker tarball — a plain FILE
-          #   /gnu/store/<hash>-docker-image.tar.gz  (~630 MB; verified as
-          #   the real item shape on the fleet builder, alongside its .drv).
-          # No find needed: searching a file returns nothing (that was run
-          # 13's FATAL). Validate the path is the file itself.
-          [ -f "$STORE_PATH" ] || { echo "FATAL: store path is not a file: '$STORE_PATH'"; exit 1; }
+          [ -f "$STORE_PATH" ] || { echo "FATAL: not a file: $STORE_PATH"; cat /tmp/guix-build-stderr.log; exit 1; }
           case "$STORE_PATH" in
             *.tar.gz) : ;;
-            *) echo "FATAL: unexpected store item name: $STORE_PATH";
-             cat /tmp/guix-build-stderr.log; exit 1 ;;
+            *) echo "FATAL: unexpected store item name: $STORE_PATH"; cat /tmp/guix-build-stderr.log; exit 1 ;;
           esac
           cp "$STORE_PATH" /tmp/executor.tar.gz
-          ls -lh /tmp/executor.tar.gz
-
-      - name: Inject POSIX /bin for container runtimes
-        # Guix's `docker` image type writes /bin (directory only) at BUILD time
-        # and defers every service-time symlink (activation,
-        # special-files-service-type) to boot — but a CI runner's `docker create
-        # --entrypoint tail` never boots the Guix system, so the runner died with
-        # `exec: "tail": executable file not found in $PATH`.
-        #
-        # Guix exposes no build-time hook to inject these links (verified in
-        # source: `extras` exists in populate-root-file-system but is not plumbed
-        # to the operating-system record). So we extend the image layer itself:
-        # same store paths Guix already carries — only the /bin view changes.
-        run: |
-          set -e
-          podman load < /tmp/executor.tar.gz
-          mkdir -p /tmp/binlayer/bin
-          # Boot the image's own entrypoint (needed because /run/current-system
-          # is created by activation AT BOOT), then resolve each tool's store
-          # path inside — so links point at what this exact build shipped.
-          podman run -d --name resolve-tools localhost/guix:latest
-          for i in $(seq 1 30); do
-            podman exec resolve-tools /run/current-system/profile/bin/ls /bin >/dev/null 2>&1 && break
-            sleep 2
-          done
-          # Resolve via readlink -f on /bin (created by Guix activation),
-          # NOT command -v — that returns shell builtin names (echo, true,
-          # printf) instead of store paths, which made only 5/33 tools land.
-          podman exec resolve-tools /bin/sh -c 'for t in sh bash tail head cat ls env sleep cut sort uniq wc tee mkdir rm cp mv ln chmod chown echo printf true false grep sed awk gawk find xargs tar gzip which; do p=$(readlink -f "/bin/$t" 2>/dev/null || true); case "$p" in /bin/*|"") continue;; esac; printf "%s %s\n" "$t" "$p"; done' > /tmp/binlayer/map.txt
-          podman stop resolve-tools && podman rm resolve-tools
-          echo "=== tools resolved from image ==="
-          cat /tmp/binlayer/map.txt
-          wc -l < /tmp/binlayer/map.txt
-          # Build the new layer: /bin/<tool> -> <store path> symlinks.
-          # Guards (all caught by local testing before this push):
-          #  - empty path → `ln -sf` would create a dangling/blank link
-          #  - a resolved path under /bin → self-referential symlink loop,
-          #    which crun reports as "Too many levels of symbolic links"
-          n=0
-          while read -r name path; do
-            [ -n "$name" ] && [ -n "$path" ] || continue
-            case "$path" in /bin/*) echo "SKIP (loop): $name -> $path"; continue ;; esac
-            ln -sf "$path" "/tmp/binlayer/bin/$name"
-            n=$((n + 1))
-          done < /tmp/binlayer/map.txt
-          echo "links created: $n"
-          [ "$n" -ge 10 ] || { echo "FATAL: only $n links — tool resolution failed"; cat /tmp/binlayer/map.txt; exit 1; }
-          # Hard guarantees for the runner contract.
-          [ -e /tmp/binlayer/bin/tail ] || { echo "FATAL: /bin/tail missing from layer"; exit 1; }
-          [ -e /tmp/binlayer/bin/sh ] || { echo "FATAL: /bin/sh missing from layer"; exit 1; }
-          # Append the layer to the existing docker-archive (last layer wins).
-          podman build -t localhost/guix:latest -f - /tmp/binlayer <<'DOCKERFILE'
-          FROM localhost/guix:latest
-          COPY bin /bin
-          DOCKERFILE
-          podman save -o /tmp/executor-patched.tar.gz localhost/guix:latest
-          mv /tmp/executor-patched.tar.gz /tmp/executor.tar.gz
           ls -lh /tmp/executor.tar.gz
 
       - name: Verify image
         run: |
           ls -lh /tmp/executor.tar.gz
-          # podman save outputs plain tar (not gzipped); just load it.
+          # guix pack -f docker emits a gzipped tarball (Docker Spec v1.2).
+          gzip -t /tmp/executor.tar.gz
           podman load < /tmp/executor.tar.gz
-          # Sanity: the injected links must resolve to real store paths.
-          # MUST boot first (own entrypoint) because /bin/sh is created by
-          # activation at boot — --entrypoint skips it (crun: not found).
-          podman run -d --name sanity localhost/guix:latest
-          for i in $(seq 1 30); do
-            podman exec sanity /bin/sh -c 'echo OK' 2>/dev/null && break
-            sleep 2
-          done
-          podman exec sanity /bin/sh -c \
-            'for t in sh bash tail head cat grep sed awk find; do
-               printf "%-6s -> %s\n" "$t" "$(readlink /bin/$t)"
-               "/bin/$t" --version >/dev/null 2>&1 || "/bin/$t" -V >/dev/null 2>&1 || true
-             done'
-          podman stop sanity && podman rm sanity
-          # GitHub Actions container protocol: the runner boots the container
-          # with --entrypoint tail -f /dev/null, then execs steps inside.
-          # Emulate that exact contract here.
-          podman run -d --name exec-smoke --entrypoint tail localhost/guix:latest -f /dev/null
-          podman exec exec-smoke /run/current-system/profile/bin/guix --version
-          podman exec exec-smoke /run/current-system/profile/bin/python3 --version
-          podman exec exec-smoke /run/current-system/profile/bin/dotnet --version
-          podman exec exec-smoke /run/current-system/profile/bin/git --version
-          podman exec exec-smoke /bin/sh -c 'echo "POSIX layer OK"'
+          # The pack image is a flat profile - no OS, no activation, nothing to
+          # boot. /bin/* are build-time symlinks into the profile store item;
+          # locate it once and reuse for every tool check.
+          podman run -d --name exec-smoke --entrypoint tail localhost/guix-pack:latest -f /dev/null
+          PROF=$(podman exec exec-smoke /bin/sh -c 'readlink -f /bin/git | sed "s|/bin/git$||"')
+          echo "profile: $PROF"
+          test -n "$PROF" || { echo "FATAL: profile not found"; podman rm -f exec-smoke; exit 1; }
+          # GitHub Actions container contract: --entrypoint tail -f /dev/null.
+          podman exec exec-smoke /bin/tail --version | head -1
+          podman exec exec-smoke /bin/sh -c "echo POSIX-layer-OK"
+          # Job toolchain (absolute paths - the image ships no PATH assumptions).
+          podman exec exec-smoke "$PROF/bin/git" --version
+          podman exec exec-smoke "$PROF/bin/python3" --version
+          podman exec exec-smoke "$PROF/bin/dotnet" --version
+          podman exec exec-smoke "$PROF/bin/guix" --version | head -1
+          podman exec exec-smoke "$PROF/bin/curl" --version | head -1
           podman stop exec-smoke && podman rm exec-smoke
+          echo "=== executor image verified (pack, /bin populated) ==="
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
