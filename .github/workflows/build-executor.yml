@@ -253,7 +253,9 @@ jobs:
 
       - name: Tag and push to GHCR
         run: |
-          SRC="localhost/guix:latest"
+          # guix pack --image-tag=guix-pack produces this exact name;
+          # the old `localhost/guix:latest` was the OS-image era tag.
+          SRC="localhost/guix-pack:latest"
           # OCI requires ALL-LOWERCASE repository paths; the GitHub owner
           # (Zhen-LinHuo) carries capitals and is rejected verbatim by
           # `podman push` with "repository name must be lowercase".
