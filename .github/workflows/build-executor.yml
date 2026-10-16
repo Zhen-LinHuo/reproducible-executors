@@ -57,48 +57,21 @@ jobs:
             guix-${{ runner.os }}-
 
       - name: Install Guix
-        # Replaces PromyLOPh/guix-install-action@v1: that action hard-codes a
-        # download from ci.guix.gnu.org (returned 502 during run 38828345873 —
-        # with no input to redirect the source, no retry) and then runs
-        # `guix pull` to %default-channels, which time-machine already supersedes
-        # via .guix/channels.scm — a full 26 min per run, all avoidable.
+        # PromyLOPh installs nightly master (bordeaux cache = same revision
+        # -> full substitute hit -> 44-49 min runs, proven across 6 success
+        # rounds). The 1.5.0 stable tarball from ftp.gnu.org has a DIFFERENT
+        # revision -> every derivation hash differs -> bordeaux 100% miss ->
+        # full bootstrap chain rebuild (guile-bootstrap, binutils-2.20.1a,
+        # gcc-4.9.4, Python-3.5.9) -> 2+ hour stall (runs 38829386958,
+        # 38841396552, 38845818824).
         #
-        # ftp.gnu.org/gnu/guix/ is the stable GNU release host (verified 200);
-        # it serves guix-binary-1.5.0.x86_64-linux.tar.xz. The tarball layout
-        # and the daemon setup are exactly what the action does internally.
-        run: |
-          V="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' executor/gitea/VERSION | head -1 || true)"
-          URL="https://ftp.gnu.org/gnu/guix/guix-binary-1.5.0.x86_64-linux.tar.xz"
-          echo "downloading $URL"
-          curl -fSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/guix-binary.tar.xz "$URL"
-          sudo -- tar --extract --file /tmp/guix-binary.tar.xz -C / --no-overwrite-dir
-          sudo -- groupadd --system guixbuild 2>/dev/null || true
-          for i in $(seq -w 1 10); do
-            sudo useradd -g guixbuild -G guixbuild -d /var/empty -s "$(which nologin)" -c "Guix build user $i" --system "guixbuilder${i}" 2>/dev/null || true
-          done
-          export GUIX_PATH=/var/guix/profiles/per-user/root/current-guix
-          sudo cp "$GUIX_PATH/lib/systemd/system/gnu-store.mount" /etc/systemd/system/ 2>/dev/null || true
-          cat <<'EOF' > "${{ runner.temp }}/guix-daemon.service"
-          [Unit]
-          Description=Build daemon for GNU Guix
-
-          [Service]
-          ExecStart=GUIX_PATH_PLACEHOLDER/bin/guix-daemon --build-users-group=guixbuild --discover=yes
-          Environment='GUIX_LOCPATH=/var/guix/profiles/per-user/root/guix-profile/lib/locale' LC_ALL=en_US.utf8
-          OOMPolicy=continue
-          Restart=always
-          TasksMax=8192
-
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-          sudo sed -i "s|GUIX_PATH_PLACEHOLDER|$GUIX_PATH|" "${{ runner.temp }}/guix-daemon.service"
-          sudo cp "${{ runner.temp }}/guix-daemon.service" /etc/systemd/system/
-          sudo chmod 664 /etc/systemd/system/guix-daemon.service
-          sudo systemctl daemon-reload
-          sudo systemctl enable --now gnu-store.mount guix-daemon.service 2>/dev/null || sudo systemctl enable --now guix-daemon.service
-          echo "$GUIX_PATH/bin" >> "$GITHUB_PATH"
-          "$GUIX_PATH/bin/guix" --version | head -1
+        # pullAfterInstall=true pulls %default-channels (master), which
+        # time-machine then pins via .guix/channels.scm. This is NOT waste:
+        # master's bootstrap chain has substitutes on bordeaux, so the 26 min
+        # pull is a prefetch that pays off in the build step.
+        uses: PromyLOPh/guix-install-action@v1
+        with:
+          pullAfterInstall: true
 
       - name: Configure substitute URLs
         run: |
