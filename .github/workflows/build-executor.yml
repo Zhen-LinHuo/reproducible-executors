@@ -235,11 +235,14 @@ jobs:
           LAYER=$(tar -tf /tmp/executor.tar.gz | grep 'layer.tar$' | head -1)
           tar -xOf /tmp/executor.tar.gz "$LAYER" > /tmp/layer.tar
           SP() {  # SP <pkg-glob> <bin-tool> → 输出 /gnu/store/<hash>-<pkg>/bin/<tool>
-            tar -tf /tmp/layer.tar | grep -m1 -E "gnu/store/[^/]*$1[^/]*/bin/$2$"               || { echo "FATAL: $1/$2 not in image store" >&2; exit 1; }
+            tar -tf /tmp/layer.tar | grep -m1 -E "gnu/store/[^/]*$1[^/]*/bin/$2$" \
+              | sed 's|^gnu/store|/gnu/store|' \
+              || { echo "FATAL: $1/$2 not in image store" >&2; exit 1; }
           }
           CU_DIR=$(dirname "$(SP 'coreutils' 'tail')")
           # glibc ld-linux 在 lib/ 不在 bin/ — SP 函数硬编码 /bin/，不适用
-          GL_PATH=$(tar -tf /tmp/layer.tar | grep -m1 -E 'gnu/store/[^/]*glibc-2[^/]*/lib/ld-linux-x86-64\.so\.2$') \
+          GL_PATH=$(tar -tf /tmp/layer.tar | grep -m1 -E 'gnu/store/[^/]*glibc-2[^/]*/lib/ld-linux-x86-64\.so\.2$' \
+            | sed 's|^gnu/store|/gnu/store|') \
             || { echo "FATAL: glibc ld-linux not in image store" >&2; exit 1; }
           GL_DIR=$(dirname "$(dirname "$GL_PATH")")
           [ -n "$CU_DIR" ] && [ -n "$GL_DIR" ] || { echo "FATAL: path resolution failed (CU_DIR='$CU_DIR' GL_DIR='$GL_DIR')"; exit 1; }
