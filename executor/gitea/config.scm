@@ -9,7 +9,7 @@
 ;;;   podman load < executor.tar.gz
 
 (use-modules (gnu) (gnu packages))
-(use-package-modules admin base bash compression gawk)
+(use-package-modules admin base bash compression gawk node)
 (use-service-modules base networking ssh)
 
 (operating-system
@@ -51,6 +51,10 @@
            "python"
            "python-virtualenv"
            "python-pip"
+
+           ;; === CI runner runtime (the GitHub runner itself) ===
+           "bash"
+           "node"
 
            ;; === Guix essentials (guix shell inside jobs) ===
            "guile"
@@ -125,5 +129,6 @@
                 ("/bin/xargs" ,(file-append findutils "/bin/xargs"))
                 ("/bin/tar" ,(file-append tar "/bin/tar"))
                 ("/bin/gzip" ,(file-append gzip "/bin/gzip"))
+                ("/bin/node" ,(file-append node "/bin/node"))
                 ("/bin/which" ,(file-append which "/bin/which")))))
     %base-services)))
