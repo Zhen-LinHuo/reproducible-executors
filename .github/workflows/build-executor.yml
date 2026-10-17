@@ -238,7 +238,10 @@ jobs:
             tar -tf /tmp/layer.tar | grep -m1 -E "gnu/store/[^/]*$1[^/]*/bin/$2$"               || { echo "FATAL: $1/$2 not in image store" >&2; exit 1; }
           }
           CU_DIR=$(dirname "$(SP 'coreutils' 'tail')")
-          GL_DIR=$(SP 'glibc-2[^/]*' 'ld-linux-x86-64.so.2' | xargs dirname | xargs dirname)
+          # glibc ld-linux 在 lib/ 不在 bin/ — SP 函数硬编码 /bin/，不适用
+          GL_PATH=$(tar -tf /tmp/layer.tar | grep -m1 -E 'gnu/store/[^/]*glibc-2[^/]*/lib/ld-linux-x86-64\.so\.2$') \
+            || { echo "FATAL: glibc ld-linux not in image store" >&2; exit 1; }
+          GL_DIR=$(dirname "$(dirname "$GL_PATH")")
           [ -n "$CU_DIR" ] && [ -n "$GL_DIR" ] || { echo "FATAL: path resolution failed (CU_DIR='$CU_DIR' GL_DIR='$GL_DIR')"; exit 1; }
           # 2. 起注入容器（entrypoint = 镜像内 store 的 tail 绝对路径，绕过 /bin 空）
           echo "entrypoint tail: $CU_DIR/bin/tail"
