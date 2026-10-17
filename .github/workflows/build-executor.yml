@@ -282,8 +282,13 @@ jobs:
           # 5b. libstdc++/libgcc_s（路径已在 step 1 解析为 CL_DIR）
           podman exec inject "$LN" -sf "$CL_DIR/lib/libstdc++.so.6" /lib64/libstdc++.so.6
           podman exec inject "$LN" -sf "$CL_DIR/lib/libgcc_s.so.1" /lib64/libgcc_s.so.1
-          # 6. commit 成新镜像
-          podman commit inject localhost/guix:latest
+          # 6. commit 成新镜像 + 设 LD_LIBRARY_PATH
+          # 为什么是 ENV 而不是 /lib64 symlink：Guix 的 ld-linux 编译内默认搜索路径
+          # 是 /gnu/store/...-glibc-2.41/lib/（strings 实测），完全不搜 /lib64。
+          # /lib64/ld-linux 能工作只因为它是 ELF interp 的字面路径（内核直查）；
+          # libstdc++ 由 loader 走搜索路径找 → 必须经 LD_LIBRARY_PATH 注入。
+          # 镜像 ENV 由 job 容器继承（日志里 NODE_PATH 等即此机制）。
+          podman commit --change "ENV LD_LIBRARY_PATH=$CL_DIR/lib" inject localhost/guix:latest
           podman rm -f inject
           echo "=== injected: $(tar -tf /tmp/layer.tar | grep -c 'gnu/store') store items available ==="
 
@@ -310,8 +315,24 @@ jobs:
           done
           # /lib64/ld-linux 存在（宿主 node exec 前提）
           podman exec exec-smoke /bin/sh -c 'test -e /lib64/ld-linux-x86-64.so.2 && echo "ld-linux: OK"'
+          # 图像 ENV 必须带 LD_LIBRARY_PATH（Guix loader 不搜 /lib64，只认它 + store lib/）
+          podman inspect localhost/guix:latest --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -q LD_LIBRARY_PATH \
+            && echo "LD_LIBRARY_PATH in image ENV: OK" \
+            || { echo "FATAL: image ENV lacks LD_LIBRARY_PATH — runner externals node will fail"; podman rm -f exec-smoke; exit 1; }
+          # === 真实回归：把 runner 自己的 externals node（报错的那个二进制）放进容器执行 ===
+          # 这就是 /__e/node24/bin/node —— 之前失败的精确复现，Verify 在推 GHCR 之前拦截坏镜像
+          EXT=$(ls -d /home/runner/actions-runner/cached/*/externals 2>/dev/null | head -1)
+          if [ -n "$EXT" ]; then
+            podman cp "$EXT" exec-smoke:/tmp/__e
+            echo "--- host externals node inside container (exact CI failure binary) ---"
+            podman exec exec-smoke /tmp/__e/node24/bin/node --version \
+              || { echo "FATAL: externals node failed to run — same as bootstrap failure"; podman rm -f exec-smoke; exit 1; }
+            echo "externals node: OK"
+          else
+            echo "WARN: externals path not found on host — skipped real-node test"
+          fi
           podman stop exec-smoke && podman rm exec-smoke
-          echo "=== executor image verified (OS + injected /bin + /lib64) ==="
+          echo "=== executor image verified (OS + injected /bin + /lib64 + LD_LIBRARY_PATH) ==="
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
