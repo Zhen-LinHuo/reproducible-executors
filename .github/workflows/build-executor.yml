@@ -252,7 +252,16 @@ jobs:
             | sed 's|^gnu/store|/gnu/store|') \
             || { echo "FATAL: libstdc++ not in image store" >&2; exit 1; }
           CL_DIR=$(dirname "$(dirname "$CL")")
-          [ -n "$CU_DIR" ] && [ -n "$GL_DIR" ] && [ -n "$CL_DIR" ] || { echo "FATAL: path resolution failed (CU_DIR='$CU_DIR' GL_DIR='$GL_DIR' CL_DIR='$CL_DIR')"; exit 1; }
+          # OS system derivation（含 profile/bin/{guix,python3,git}）—— activation 会建
+          # /run/current-system -> 这个 -system；runner --entrypoint tail 跳过 boot → 不 activation。
+          # 自举 workflow 的 13 处 /run/current-system/profile/bin/* 依赖它。找法同上：
+          # 从 layer 列表（镜像 closure 必含 $os —— entry-point '(#$boot-program #$os)，
+          # image.scm:849；否则 docker create 早失败了）。
+          SYS=$(tar -tf /tmp/layer.tar | grep -m1 -E 'gnu/store/[^/]+-system/profile/bin/guix$' \
+            | sed -E 's|gnu/store/([^/]+)/profile/bin/guix$|gnu/store/\1|' \
+            | sed 's|^gnu/store|/gnu/store|') \
+            || { echo "FATAL: -system not in image store" >&2; exit 1; }
+          [ -n "$CU_DIR" ] && [ -n "$GL_DIR" ] && [ -n "$CL_DIR" ] && [ -n "$SYS" ] || { echo "FATAL: path resolution failed (CU_DIR='$CU_DIR' GL_DIR='$GL_DIR' CL_DIR='$CL_DIR' SYS='$SYS')"; exit 1; }
           # 2. 起注入容器（entrypoint = 镜像内 store 的 tail 绝对路径，绕过 /bin 空）
           echo "entrypoint tail: $CU_DIR/bin/tail"
           podman run -d --name inject --entrypoint "$CU_DIR/bin/tail" localhost/guix:latest -f /dev/null
@@ -282,6 +291,11 @@ jobs:
           # 5b. libstdc++/libgcc_s（路径已在 step 1 解析为 CL_DIR）
           podman exec inject "$LN" -sf "$CL_DIR/lib/libstdc++.so.6" /lib64/libstdc++.so.6
           podman exec inject "$LN" -sf "$CL_DIR/lib/libgcc_s.so.1" /lib64/libgcc_s.so.1
+          # 5c. /run/current-system → OS system store item（自举 workflow 的 13 处依赖）
+          # activation-time 创建的 symlink；runner --entrypoint tail 跳过 boot → 不 activation。
+          # system profile 含 guix/python3/git（本机 77qp2z4 实测）。从 layer 提取 store path。
+          podman exec inject "$LN" -s "$SYS" /run/current-system
+          echo "run/current-system: /run/current-system → $SYS"
           # 6. commit 成新镜像 + 设 LD_LIBRARY_PATH
           # 为什么是 ENV 而不是 /lib64 symlink：Guix 的 ld-linux 编译内默认搜索路径
           # 是 /gnu/store/...-glibc-2.41/lib/（strings 实测），完全不搜 /lib64。
@@ -315,6 +329,11 @@ jobs:
           done
           # /lib64/ld-linux 存在（宿主 node exec 前提）
           podman exec exec-smoke /bin/sh -c 'test -e /lib64/ld-linux-x86-64.so.2 && echo "ld-linux: OK"'
+          # /run/current-system 必须存在且指向 -system（自举 workflow 的 13 处依赖）
+          podman exec exec-smoke /bin/ls -la /run/current-system 2>&1 \
+            && podman exec exec-smoke /bin/test -x /run/current-system/profile/bin/guix \
+            && echo "run/current-system → profile/bin/guix: OK" \
+            || { echo "FATAL: /run/current-system missing or profile/bin/guix not executable — bootstrap will fail"; podman rm -f exec-smoke; exit 1; }
           # 图像 ENV 必须带 LD_LIBRARY_PATH（Guix loader 不搜 /lib64，只认它 + store lib/）
           podman inspect localhost/guix:latest --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -q LD_LIBRARY_PATH \
             && echo "LD_LIBRARY_PATH in image ENV: OK" \
