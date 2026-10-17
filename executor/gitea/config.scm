@@ -55,6 +55,7 @@
            ;; === CI runner runtime (the GitHub runner itself) ===
            "bash"
            "node"
+           "gcc"   ; libstdc++ / libgcc_s — 宿主 externals node 的动态依赖
 
            ;; === Guix essentials (guix shell inside jobs) ===
            "guile"

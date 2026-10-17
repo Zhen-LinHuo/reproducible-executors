@@ -247,7 +247,12 @@ jobs:
             | sed 's|^gnu/store|/gnu/store|') \
             || { echo "FATAL: glibc ld-linux not in image store" >&2; exit 1; }
           GL_DIR=$(dirname "$(dirname "$GL_PATH")")
-          [ -n "$CU_DIR" ] && [ -n "$GL_DIR" ] || { echo "FATAL: path resolution failed (CU_DIR='$CU_DIR' GL_DIR='$GL_DIR')"; exit 1; }
+          # glibc ld-linux 在 lib/ 不在 bin/ — SP 函数硬编码 /bin/，不适用；libstdc++/libgcc_s 同理
+          CL=$(tar -tf /tmp/layer.tar | grep -m1 -E 'gnu/store/[^/]*gcc-[0-9][^/]*/lib/libstdc\+\+\.so\.6' \
+            | sed 's|^gnu/store|/gnu/store|') \
+            || { echo "FATAL: libstdc++ not in image store" >&2; exit 1; }
+          CL_DIR=$(dirname "$(dirname "$CL")")
+          [ -n "$CU_DIR" ] && [ -n "$GL_DIR" ] && [ -n "$CL_DIR" ] || { echo "FATAL: path resolution failed (CU_DIR='$CU_DIR' GL_DIR='$GL_DIR' CL_DIR='$CL_DIR')"; exit 1; }
           # 2. 起注入容器（entrypoint = 镜像内 store 的 tail 绝对路径，绕过 /bin 空）
           echo "entrypoint tail: $CU_DIR/bin/tail"
           podman run -d --name inject --entrypoint "$CU_DIR/bin/tail" localhost/guix:latest -f /dev/null
@@ -274,6 +279,9 @@ jobs:
           podman exec inject "$LN" -sf bash /bin/sh
           # 5. /lib64/ld-linux（runner 宿主 externals node 的 ELF interp）
           podman exec inject "$LN" -sf "$GL_DIR/lib/ld-linux-x86-64.so.2" /lib64/ld-linux-x86-64.so.2
+          # 5b. libstdc++/libgcc_s（路径已在 step 1 解析为 CL_DIR）
+          podman exec inject "$LN" -sf "$CL_DIR/lib/libstdc++.so.6" /lib64/libstdc++.so.6
+          podman exec inject "$LN" -sf "$CL_DIR/lib/libgcc_s.so.1" /lib64/libgcc_s.so.1
           # 6. commit 成新镜像
           podman commit inject localhost/guix:latest
           podman rm -f inject
