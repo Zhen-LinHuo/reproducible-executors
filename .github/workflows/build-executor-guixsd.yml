@@ -1,56 +1,56 @@
-# Build the CI job executor image → GHCR, SELF-HOSTED on GuixSD.
+# Build the CI job executor image → GHCR, INSIDE the executor image itself.
 #
-# This is the SELF-BOOTSTRAPPING variant: the job runs INSIDE the GuixSD
-# executor image itself (pulled from GHCR), so the workflow that builds the
-# image also runs on the image it builds. The image provides the Guix toolchain
-# (guix, python3, git) that the build steps need — no PromyLOPh action
-# install, no PATH gymnastics, no Guix daemon setup (the image ships the daemon
-# pre-configured).
+# This is the REGULAR build path. The job runs inside the GuixSD executor image
+# pulled from GHCR, so the workflow that builds the image runs on the image it
+# builds. The image supplies the whole toolchain (guix with its daemon, podman,
+# python3, git), so there is no installer, no PATH gymnastics and no daemon
+# setup here.
 #
-# Key differences from the GitHub-hosted variant (build-executor.yml):
-#   1. `runs-on: self-hosted` + `container: ghcr.io/.../executor:latest`
-#   2. No "Install Guix" step — the image IS Guix System, guix is at
-#      /run/current-system/profile/bin/guix (absolute path, no PATH needed)
-#   3. No "Configure substitute URLs" — the image's daemon already has
-#      a private cache (optional) + SJTU + official configured
-#   4. No "Diagnose guix environment" — the environment IS the image
-#   5. Build step uses the SAME image's guix (self-referential bootstrap)
+# Triggers
+#   - push to main touching executor/**, .guix/** or this file — the normal path
+#   - workflow_run after a successful bootstrap-executor — after bootstrapping or
+#     recovery, immediately prove the fresh image can rebuild itself
+#   - workflow_dispatch — manual rebuild / version bumps
 #
-# Naming convention: `build-executor-guixsd` distinguishes this from the
-# GitHub-hosted `build-executor` workflow. Both produce the SAME image; the
-# difference is WHERE the job runs.
+# If this job cannot start because its `container:` cannot be pulled, the
+# published image is broken: run bootstrap-executor manually, and this workflow
+# re-runs automatically on its success.
+#
+# The bootstrap/recovery counterpart is bootstrap-executor.yml (manual only).
 
 name: build-executor-guixsd
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'executor/**'
+      - '.guix/**'                                # channel pins change the build
+      - '.github/workflows/build-executor-guixsd.yml'
   workflow_run:
-    # Chain after build-executor.yml succeeds — the executor-guixsd image
-    # must exist in GHCR BEFORE this job tries to pull it. Push triggers
-    # would race the build and fail with "manifest unknown".
-    workflows: [build-executor]
+    # After a bootstrap or a recovery run, rebuild the fresh image with itself.
+    workflows: [bootstrap-executor]
     types: [completed]
     branches: [main]
-  workflow_dispatch:  # manual trigger (version bumps, retries)
+  workflow_dispatch:  # manual rebuild / version bumps
 
 permissions:
   contents: read
   packages: write  # push to GHCR
 
-# Serialise stage-2 runs. A workflow_run chain (after stage 1) and a manual
-# workflow_dispatch can otherwise overlap; two jobs both pulling + pushing
-# executor-guixsd:latest would race and the second could clobber the first.
-# No cancel-in-progress: a queued run should still run (it re-pulls the latest
-# the finished one just pushed), just never concurrently.
+# Serialise runs: a push, a bootstrap chain and a manual dispatch can coincide,
+# and two jobs both pulling + pushing executor-guixsd:latest would race — one
+# could clobber the other. No cancel-in-progress: a queued run should still run
+# (it re-pulls the latest the finished one just pushed), just never concurrently.
 concurrency:
   group: build-executor-guixsd
   cancel-in-progress: false
 
 jobs:
   build:
-    # Only run if the upstream build-executor.yml succeeded (image pushed
-    # to GHCR). `workflow_run` fires on completed regardless of conclusion.
-    # workflow_dispatch bypasses this gate (no workflow_run context).
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    # Run on push / dispatch directly; on a bootstrap chain, only when the
+    # bootstrap actually succeeded (workflow_run fires on any conclusion).
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/zhen-linhuo/reproducible-executors/executor-guixsd:latest
@@ -100,7 +100,7 @@ jobs:
       - name: Start guix-daemon
         run: |
           # === Substitute sources — stage 1's EXACT shape and ORDER ===
-          # (build-executor.yml "Configure substitute URLs"): bordeaux FIRST
+          # (bootstrap-executor.yml "Configure substitute URLs"): bordeaux FIRST
           # (only reliable public farm), the private cache SECOND (optional, secret-
           # driven), then ci.guix + SJTU as fallback.
           # Stage 1 puts this on the DAEMON via a systemd drop-in

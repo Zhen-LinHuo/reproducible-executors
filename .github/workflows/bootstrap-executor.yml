@@ -1,10 +1,9 @@
-# Build the CI job executor image → GHCR.
+# Bootstrap the CI job executor image → GHCR.
 #
-# ONE executor image: a Guix System OS + job toolchain (git, .NET, Python,
-# guix, make, curl …). It is NOT a runner — no gitea-runner/act-runner
-# binary inside. A CI system (Gitea Actions / Forgejo / GitHub) runs its
-# runner process elsewhere and executes job steps inside this image, so
-# there are no per-CI variants and no variant tags: one image, one tag.
+# ONE executor image: a Guix System OS plus the job toolchain (guix, podman,
+# python3, git, node, bash, curl …). It is NOT a runner — no act-runner binary
+# inside. A CI system runs its runner elsewhere and executes job steps inside
+# this image, so there are no per-CI variants and no variant tags.
 #
 # Substitute policy by runner class (this workflow is GitHub-hosted):
 #   - GitHub-hosted runners have no IPv6 egress; a private cache may be IPv6-only,
@@ -14,16 +13,22 @@
 #   - Self-hosted runners substitute the private cache first; the
 #     GUIX_CACHE_URL secret carries that URL for workflows that run there.
 
-name: build-executor
+name: bootstrap-executor
 
+# BOOTSTRAP / RECOVERY PATH — manual only.
+#
+# The regular build is build-executor-guixsd.yml, which builds the image
+# INSIDE the previously published image (self-bootstrapping) on every push.
+# This workflow instead installs Guix from scratch on a GitHub-hosted runner,
+# so it is needed only for:
+#   1. the first build, when no executor image exists in GHCR yet; and
+#   2. recovery, when a pushed image is broken and the self-bootstrapping
+#      build can no longer start (its `container:` cannot be pulled).
+# It is NOT triggered by push — that would duplicate every self-bootstrapping
+# build. A successful bootstrap chains build-executor-guixsd.yml, which
+# rebuilds the fresh image with itself and proves it can self-build.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'executor/**'
-      - '.guix/**'          # channel pins — changing them changes the build
-      - '.github/workflows/build-executor.yml'
-  workflow_dispatch:  # manual trigger (version bumps, retries)
+  workflow_dispatch:  # manual: first build, or recover from a broken image
 
 permissions:
   contents: read

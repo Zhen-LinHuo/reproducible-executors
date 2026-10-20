@@ -55,15 +55,18 @@ is never less complete than the original.
 
 ## CI
 
-Two workflows, in order:
+Two workflows:
 
-| Workflow | Runs on | Produces |
-|---|---|---|
-| `build-executor.yml` | GitHub-hosted runner (`ubuntu-latest`) | the image, pushed to GHCR |
-| `build-executor-guixsd.yml` | **inside the executor image** (`container:`, `--privileged`) | the same image, rebuilt by itself (bootstrap) |
+| Workflow | Trigger | Runs on | Produces |
+|---|---|---|---|
+| `build-executor-guixsd.yml` | push to `executor/**`, `.guix/**` or itself; after a bootstrap; manual | **inside the executor image** (`container:`, `--privileged`) | the image, rebuilt by itself — this is the regular path |
+| `bootstrap-executor.yml` | **manual only** | GitHub-hosted runner (`ubuntu-latest`), installing Guix from scratch | the image, pushed to GHCR — bootstrap and recovery only |
 
-`build-executor-guixsd.yml` is chained on a successful `build-executor` run and
-can also be dispatched manually.
+The regular build is the self-bootstrapping one: every change is built inside
+the image that already exists, so the executor is exercised on every push.
+`bootstrap-executor.yml` is needed only for the first build (no image in GHCR
+yet) or to recover from a broken image; a successful bootstrap chains
+`build-executor-guixsd.yml`, which rebuilds the fresh image with itself.
 
 ## Usage
 
@@ -103,8 +106,8 @@ reproducible-executors/
 │   └── VERSION                     # image version
 ├── .guix/channels.scm              # pinned Guix channel + introduction
 ├── .github/workflows/
-│   ├── build-executor.yml          # stage 1: build on GitHub-hosted runners
-│   └── build-executor-guixsd.yml   # stage 2: self-bootstrapping build
+│   ├── build-executor-guixsd.yml   # regular: build inside the image itself
+│   └── bootstrap-executor.yml      # manual: first build / recovery
 ├── docs/substitute-sources.md      # substitute farms and their order
 ├── AGENTS.md
 └── README.md
