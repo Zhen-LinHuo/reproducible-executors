@@ -1,0 +1,379 @@
+# Build the CI job executor image → GHCR, SELF-HOSTED on GuixSD.
+#
+# This is the SELF-BOOTSTRAPPING variant: the job runs INSIDE the GuixSD
+# executor image itself (pulled from GHCR), so the workflow that builds the
+# image also runs on the image it builds. The image provides the Guix toolchain
+# (guix, python3, git) that the build steps need — no PromyLOPh action
+# install, no PATH gymnastics, no Guix daemon setup (the image ships the daemon
+# pre-configured).
+#
+# Key differences from the GitHub-hosted variant (build-executor.yml):
+#   1. `runs-on: self-hosted` + `container: ghcr.io/.../executor:latest`
+#   2. No "Install Guix" step — the image IS Guix System, guix is at
+#      /run/current-system/profile/bin/guix (absolute path, no PATH needed)
+#   3. No "Configure substitute URLs" — the image's daemon already has
+#      a private cache (optional) + SJTU + official configured
+#   4. No "Diagnose guix environment" — the environment IS the image
+#   5. Build step uses the SAME image's guix (self-referential bootstrap)
+#
+# Naming convention: `build-executor-guixsd` distinguishes this from the
+# GitHub-hosted `build-executor` workflow. Both produce the SAME image; the
+# difference is WHERE the job runs.
+
+name: build-executor-guixsd
+
+on:
+  workflow_run:
+    # Chain after build-executor.yml succeeds — the executor-guixsd image
+    # must exist in GHCR BEFORE this job tries to pull it. Push triggers
+    # would race the build and fail with "manifest unknown".
+    workflows: [build-executor]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:  # manual trigger (version bumps, retries)
+
+permissions:
+  contents: read
+  packages: write  # push to GHCR
+
+# Serialise stage-2 runs. A workflow_run chain (after stage 1) and a manual
+# workflow_dispatch can otherwise overlap; two jobs both pulling + pushing
+# executor-guixsd:latest would race and the second could clobber the first.
+# No cancel-in-progress: a queued run should still run (it re-pulls the latest
+# the finished one just pushed), just never concurrently.
+concurrency:
+  group: build-executor-guixsd
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Only run if the upstream build-executor.yml succeeded (image pushed
+    # to GHCR). `workflow_run` fires on completed regardless of conclusion.
+    # workflow_dispatch bypasses this gate (no workflow_run context).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/zhen-linhuo/reproducible-executors/executor-guixsd:latest
+      # ROOT CAUSE of `clone: Operation not permitted` (run 39357389869,
+      # PROBE D backtrace): it is NOT a git clone — the error is a
+      # &store-protocol-error (daemon RPC) raised while the daemon BUILDS a
+      # derivation locally. guix-daemon's build sandbox calls clone(2) with
+      # CLONE_NEWNS|CLONE_NEWPID|... to isolate the builder; GitHub's docker
+      # container applies the default seccomp profile, which blocks that
+      # (the adjacent "ADDR_NO_RANDOMIZE personality ... blocked" line is the
+      # same restriction signature). Substitute downloads succeed because
+      # they run in the client, not in a namespaced child.
+      # --privileged lifts seccomp + grants CAP_SYS_ADMIN so the daemon can
+      # create the namespaces it needs to build.
+      options: --privileged
+      # Guix System images need /run writable (activation creates
+      # /run/current-system symlink there at boot) and /tmp writable
+      # (TMPDIR for builds). Podman's default tmpfs mounts cover both.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Stage 2 has NO cache — every cold run re-clones the guix channel
+      # (~7.5 min measured, `Updating channel` -> `Authenticating ... (841 new
+      # commits)`) before doing any real work, and if the run dies the clone is
+      # paid again next time. Cache the checkout that the Build step writes to
+      # $XDG_CACHE_HOME/guix (/tmp/.cache here). Restoring it makes `guix
+      # time-machine` skip the clone and start at authentication/build, so a
+      # resumed run does not re-pay it. Key on the pin + config: a new pinned
+      # commit (追新) changes the key and correctly re-clones fresh.
+      - name: Restore Guix channel cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.cache/guix
+          key: guix-sd-${{ runner.os }}-${{ hashFiles('.guix/channels.scm', 'executor/gitea/config.scm') }}
+          restore-keys: |
+            guix-sd-${{ runner.os }}-
+
+
+      # The runner starts the container with --entrypoint tail, skipping boot
+      # entirely. This means shepherd never runs and guix-daemon never starts,
+      # leaving /var/guix/daemon-socket/socket missing (third activation-time
+      # gap after /bin and /run/current-system). Diagnose's `guix --version`
+      # passes (pure local), but Build's `guix time-machine` fails:
+      #   error: failed to connect to `/var/guix/daemon-socket/socket'
+      # Start the daemon here so Build can actually build.
+      - name: Start guix-daemon
+        run: |
+          # === Substitute sources — stage 1's EXACT shape and ORDER ===
+          # (build-executor.yml "Configure substitute URLs"): bordeaux FIRST
+          # (only reliable public farm), the private cache SECOND (optional, secret-
+          # driven), then ci.guix + SJTU as fallback.
+          # Stage 1 puts this on the DAEMON via a systemd drop-in
+          # (GUIX_SUBSTITUTE_URLS) — we pass the same list as a daemon flag so
+          # both stages configure the daemon, not just the client. The list is
+          # written to /tmp/subs.txt because steps share the container FS but
+          # NOT shell variables; the Build step reads it back verbatim.
+          SUBS="https://bordeaux.guix.gnu.org"
+          if [ -n "${{ secrets.GUIX_CACHE_URL }}" ]; then
+            SUBS="$SUBS ${{ secrets.GUIX_CACHE_URL }}"
+          fi
+          SUBS="$SUBS https://ci.guix.gnu.org https://mirror.sjtu.edu.cn/guix/"
+          printf '%s' "$SUBS" > /tmp/subs.txt
+          echo "substitute-urls = $SUBS"
+          GUIX_DAEMON=$(find /gnu/store -maxdepth 3 -name 'guix-daemon' -type f 2>/dev/null | head -1)
+          [ -n "$GUIX_DAEMON" ] || { echo "FATAL: guix-daemon binary not found"; exit 1; }
+          echo "starting $GUIX_DAEMON"
+          # --allow-aslr: GitHub's container: blocks personality(ADDR_NO_RANDOMIZE),
+          # so the daemon would refuse to start (guix-daemon.cc: "we simply don't
+          # use it"). Verified in-image: daemon --help lists --allow-aslr. This is
+          # a daemon flag, NOT a `guix time-machine` flag (adding it there fails
+          # with "unrecognized option" — run 39183927477).
+          # --substitute-urls: daemon-level default (daemon --help lists it),
+          # mirroring stage 1's GUIX_SUBSTITUTE_URLS drop-in.
+          # --build-users-group: matches stage 1's systemd unit exactly
+          # (ExecStart=guix-daemon --build-users-group=guixbuild). Without it the
+          # daemon falls back to building as root — and chowns store entries to
+          # guixbuilder01-10 (uid 432-441), which only exist once Inject writes
+          # them into /etc/passwd. That mismatch is the EPERM behind
+          # `guix time-machine: error: clone: Operation not permitted`.
+          # Launch the daemon with stdout/stderr redirected to a persisted file
+          # and stdin from /dev/null — decoupling its output from this step's
+          # pipe WITHOUT `setsid` (which is absent from this image's PATH, only
+          # /gnu/store/...-profile/bin is present, and the bare `setsid` failed
+          # "command not found" in run 39364082870). A plain `&` already keeps
+          # the daemon alive across steps — every prior run proved this: the
+          # daemon started with `&` was still serving the Build step's
+          # time-machine call. Only its OUTPUT was the problem (bound to the
+          # closed step pipe, hence the invisible death). So: background, but
+          # point its fds at /tmp/daemon.log. $! is then the daemon PID itself.
+          # SSL_CERT_FILE is exported for the DAEMON's own process too: when it
+          # runs builtin:download to fetch fixed-output sources (mirror://gnu
+          # etc.) it verifies TLS with gnutls, which needs the CA bundle — the
+          # Build step only set it for the CLIENT, not for the daemon launched
+          # in this separate earlier step.
+          export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+          "$GUIX_DAEMON" \
+            --allow-aslr --build-users-group=guixbuild --substitute-urls="$SUBS" \
+            > /tmp/daemon.log 2>&1 < /dev/null &
+          DAEMON_PID=$!
+          sleep 2
+          if kill -0 "$DAEMON_PID" 2>/dev/null; then
+            echo "daemon running (PID $DAEMON_PID), log at /tmp/daemon.log"
+          else
+            echo "FATAL: daemon failed to start"
+            cat /tmp/daemon.log
+            exit 1
+          fi
+
+      - name: Authorize substitutes + generate daemon keypair
+        # Stage 1 runs these in "Install Guix" (both REQUIRED, see
+        # guixsd-executor-ci-bootstrap §7). The bootstrap had NEITHER — that is
+        # why every run logged `guix substitute: warning: ACL for archive
+        # imports seems to be uninitialized` and every source returned 0.0%:
+        # without --authorize the client refuses ALL substitutes regardless of
+        # source, and without --generate-key the daemon has no signing keypair.
+        # .pub files ship in the image's own guix store item (verified
+        # in-image: 4 keys — ci/bordeaux/berlin/ci.guix.info).
+        run: |
+          # PATH in this container is ONLY /gnu/store/...-profile/bin (verified
+          # in-image) — it does NOT include /bin, so a bare `dirname`/`basename`
+          # dies with `command not found` (exit 127, run 39204911726 step 5).
+          # Stage 1 avoids this by always using absolute paths ($GUIX_PATH/bin/...).
+          # Use POSIX parameter expansion instead — no external command, no PATH:
+          #   ${GUIX%/bin/guix}  strips the trailing /bin/guix  -> profile root
+          #   ${F##*/}           strips everything up to the last / -> basename
+          GUIX=$(ls /gnu/store/*-profile/bin/guix 2>/dev/null | head -1)
+          [ -n "$GUIX" ] || { echo "FATAL: guix not found in image store"; exit 1; }
+          PUBDIR="${GUIX%/bin/guix}/share/guix"
+          ls "$PUBDIR"/*.pub >/dev/null 2>&1 || { echo "FATAL: no .pub keys at $PUBDIR"; exit 1; }
+          for F in "$PUBDIR"/*.pub; do
+            echo "authorizing ${F##*/}"
+            "$GUIX" archive --authorize < "$F"
+          done
+          echo "generating daemon keypair"
+          "$GUIX" archive --generate-key
+
+      - name: Diagnose executor environment
+        run: |
+          # The image IS the environment — this step is EVIDENCE, not setup.
+          # If this fails, the image is broken, not the workflow.
+          echo "guix: $(/run/current-system/profile/bin/guix --version 2>&1 | head -1)"
+          echo "python3: $(/run/current-system/profile/bin/python3 --version 2>&1 | head -1)"
+          echo "git: $(/run/current-system/profile/bin/git --version 2>&1 | head -1)"
+
+      - name: Build executor image (docker format)
+        run: |
+          # Self-referential bootstrap: use THIS image's guix to build the
+          # image from config.scm. The channel pin (.guix/channels.scm) is
+          # the same as the GitHub-hosted variant — the official channel,
+          # pinned to the bordeaux-built revision.
+          # The image's daemon already has a private cache + SJTU + official
+          # substitutes configured, so the build pulls from the fastest
+          # available source.
+          # SUBSTITUTE_URLS at BOTH layers (aigate guix-drift shape): the
+          # time-machine layer resolves channels and the inner `system image`
+          # resolves packages, each consulting substitutes independently.
+          # Explicit here rather than trusting the image's daemon config —
+          # a self-hosted runner's host may inject its own daemon settings,
+          # and the workflow must not depend on that ambient state.
+          # Read the list the Start guix-daemon step wrote — single source,
+          # no drift between daemon flag and client flag.
+          SUBS=$(cat /tmp/subs.txt)
+          [ -n "$SUBS" ] || { echo "FATAL: /tmp/subs.txt empty — daemon step did not run?"; exit 1; }
+          echo "substitute-urls = $SUBS"
+          # These exports are defensive and correct on their own terms (git
+          # needs the injected CA bundle; the checkout cache belongs on a
+          # writable filesystem). They were never the fix for the bootstrap
+          # failure — that was `container.options: --privileged` (see the
+          # container block), which lets guix-daemon call clone(2) to sandbox
+          # a build. The failure was a &store-protocol-error naming clone(2),
+          # not a git/network problem; PROBE D's backtrace (run 39358552500)
+          # proved the daemon builds normally once seccomp is lifted.
+          export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+          export GIT_SSL_CAINFO=$SSL_CERT_FILE
+          export XDG_CACHE_HOME=/tmp/.cache
+          mkdir -p "$XDG_CACHE_HOME/guix/checkouts"
+          # CI PATH excludes profile/bin, so bare guix would 127; absolute path.
+          G=/run/current-system/profile/bin/guix
+          # The real build: resolve the pinned channel, then build the docker
+          # system image from config.scm. substitute-urls on the time-machine
+          # layer; the inner `system image` inherits the daemon's own flag.
+          # Capture full output to a file and check the guix exit code
+          # explicitly (a pipe to `tail` alone would mask it). If it fails, dump
+          # the DAEMON log — the client-side &nar-error only says the daemon
+          # died; /tmp/daemon.log says WHY (this is the diagnostic the earlier
+          # runs structurally could not produce).
+          set +e
+          $G time-machine \
+            -C .guix/channels.scm \
+            --substitute-urls="$SUBS" -- \
+            system image -t docker \
+            executor/gitea/config.scm > /tmp/build.log 2>&1
+          RC=$?
+          set -e
+          echo "=== build.log tail ==="
+          tail -40 /tmp/build.log
+          if [ "$RC" -ne 0 ]; then
+            echo "=== BUILD FAILED rc=$RC — daemon log (/tmp/daemon.log) ==="
+            tail -60 /tmp/daemon.log
+            echo "=== end daemon log ==="
+            exit "$RC"
+          fi
+          # The store path is the last line of a successful `system image`.
+          STORE_PATH=$(tail -1 /tmp/build.log)
+          echo "store path: $STORE_PATH"
+          # The store item IS the gzipped docker tarball (~867 MB).
+          [ -f "$STORE_PATH" ] || { echo "FATAL: store path is not a file: '$STORE_PATH'"; exit 1; }
+          case "$STORE_PATH" in
+            *.tar.gz) : ;;
+            *) echo "FATAL: unexpected store item name: $STORE_PATH"; exit 1 ;;
+          esac
+          cp "$STORE_PATH" /tmp/executor.tar.gz
+          ls -lh /tmp/executor.tar.gz
+
+      # The bootstrap must reproduce the FULL stage-1 pipeline, not just
+      # `guix system image`: the raw tarball has empty /bin, /lib64,
+      # /run/current-system and /etc (all activation-time). Pushing it as-is
+      # ships a BROKEN executor that can't start its own daemon — which is
+      # exactly the week of EPERM/SSL/EAI_SERVICE failures. So Extract the
+      # special-files list, then run the SHARED executor/gitea/inject.sh, then
+      # verify the injected image, then push. Same script + same config as
+      # stage 1 => the bootstrap image can never be less complete than stage 1's.
+      - name: Extract special-files from config.scm (single source)
+        run: |
+          /run/current-system/profile/bin/guix repl executor/gitea/extract-special-files.scm > /tmp/special-files.tsv
+          N=$(grep -vc '^#' /tmp/special-files.tsv || true)
+          echo "extracted $N special-files entries"
+          [ "$N" -ge 30 ] || { echo "FATAL: extracted only $N entries (expected ~35)" >&2; exit 1; }
+
+      - name: Inject special-files and /etc (shared pipeline)
+        # The same executor/gitea/inject.sh stage 1 runs. Stage 2 runs INSIDE
+        # the injected latest image, so tar/bash/grep/dirname are present (/bin
+        # symlinks from stage 1's injection); PODMAN is the image's own podman
+        # (now baked into config.scm packages). inject.sh does load/tag/commit
+        # only — the nested operation set the daemon already proved works with
+        # clone(2) under --privileged.
+        run: |
+          export PATH=/bin:/run/current-system/profile/bin:$PATH
+          PODMAN=/run/current-system/profile/bin/podman bash executor/gitea/inject.sh
+
+      - name: Verify image
+        run: |
+          # Two layers of proof: (1) the raw guix artifact is a well-formed
+          # docker image (gzip + manifest + size — a cheap guard against a
+          # truncated time-machine build before we trust anything), then (2) the
+          # injection inject.sh just performed is really present (boot the image
+          # and probe /bin/tail, the OS profile, the 10 build users, the CA
+          # bundle, /etc/services). podman ships in the image now (config.scm).
+          ls -lh /tmp/executor.tar.gz
+          gzip -t /tmp/executor.tar.gz
+          echo "gzip integrity: OK"
+          tar tzf /tmp/executor.tar.gz > /tmp/img-list.txt
+          echo "=== image manifest/layer entries (first 10) ==="
+          grep -aE "manifest\.json|index\.json|repositories|/layer\.tar|blobs/" /tmp/img-list.txt | head -10
+          if grep -qaE "manifest\.json|index\.json|repositories" /tmp/img-list.txt; then
+            echo "docker image manifest: PRESENT"
+          else
+            echo "FATAL: not a docker image — no manifest in tarball"; exit 1
+          fi
+          # Sanity: a system image is large; a truncated build is the failure
+          # mode this guards against.
+          SZ=$(wc -c < /tmp/executor.tar.gz)
+          if [ "$SZ" -lt 100000000 ]; then
+            echo "FATAL: image suspiciously small ($SZ bytes)"; exit 1
+          fi
+          echo "size check: OK ($SZ bytes)"
+          # inject.sh already loaded + committed localhost/guix:latest (injected).
+          # Do NOT re-load the raw tarball here — that would clobber the injection
+          # and push a broken image. Assert the injection is present instead.
+          PODMAN=/run/current-system/profile/bin/podman
+          "$PODMAN" images
+          "$PODMAN" inspect localhost/guix:latest --format '{{range .Config.Env}}{{println .}}{{end}}' \
+            | grep -q LD_LIBRARY_PATH \
+            && echo "LD_LIBRARY_PATH in image ENV: OK" \
+            || { echo "FATAL: image ENV lacks LD_LIBRARY_PATH — inject.sh did not commit?"; exit 1; }
+          # Boot the injected image (nested container under --privileged — the
+          # same namespace clone the daemon proved works) and probe real files.
+          "$PODMAN" rm -f bsmoke 2>/dev/null || true
+          "$PODMAN" run -d --name bsmoke --entrypoint tail localhost/guix:latest -f /dev/null
+          sleep 2
+          "$PODMAN" exec bsmoke /bin/tail --version | head -1
+          "$PODMAN" exec bsmoke /run/current-system/profile/bin/guix --version | head -1
+          "$PODMAN" exec bsmoke /bin/sh -c 'grep -q "^guixbuilder01:x:441:441:" /etc/passwd' \
+            && echo "build users present: OK" || { echo "FATAL: guixbuilder users missing"; "$PODMAN" rm -f bsmoke; exit 1; }
+          "$PODMAN" exec bsmoke /bin/sh -c '[ "$(grep -c "BEGIN CERTIFICATE" /etc/ssl/certs/ca-certificates.crt)" -gt 100 ]' \
+            && echo "CA bundle present: OK" || { echo "FATAL: CA bundle missing/short"; "$PODMAN" rm -f bsmoke; exit 1; }
+          "$PODMAN" exec bsmoke /bin/sh -c '[ "$(wc -l < /etc/services)" -gt 100 ]' \
+            && echo "/etc/services present: OK" || { echo "FATAL: /etc/services missing"; "$PODMAN" rm -f bsmoke; exit 1; }
+          "$PODMAN" stop bsmoke && "$PODMAN" rm bsmoke
+          echo "=== bootstrap image verified: injected + boots + guix works ==="
+
+      - name: Log in to GHCR
+        run: |
+          # Podman inside the image needs explicit login (no docker/login-action
+          # in a Guix System container — no docker CLI, and the action's
+          # credential helper doesn't resolve here).
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            /run/current-system/profile/bin/podman login ghcr.io \
+            -u "${{ github.actor }}" --password-stdin
+
+      - name: Tag and push to GHCR
+        run: |
+          # CI PATH in this container is only the image's default; coreutils
+          # (tr, cat) lives in the OS profile → bare `tr` gave exit 127
+          # (run 39382547428). Add the same PATH the Inject step uses.
+          export PATH=/bin:/run/current-system/profile/bin:$PATH
+          PODMAN=/run/current-system/profile/bin/podman
+          SRC="localhost/guix:latest"
+          OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          DEST="ghcr.io/${OWNER}/reproducible-executors/executor-guixsd"
+          VERSION="$(cat executor/gitea/VERSION)"
+          # Three-tag policy: v-semver / latest / sha (traceability).
+          "$PODMAN" tag "$SRC" "$DEST:v${VERSION}"
+          "$PODMAN" tag "$SRC" "$DEST:latest"
+          "$PODMAN" tag "$SRC" "$DEST:sha-${GITHUB_SHA:0:12}"
+          "$PODMAN" push "$DEST:v${VERSION}"
+          "$PODMAN" push "$DEST:latest"
+          "$PODMAN" push "$DEST:sha-${GITHUB_SHA:0:12}"
+
+      - name: Image metadata
+        run: |
+          export PATH=/bin:/run/current-system/profile/bin:$PATH
+          /run/current-system/profile/bin/podman inspect \
+            "ghcr.io/$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')/reproducible-executors/executor-guixsd:latest" \
+            --format '{{.Size}} bytes'
