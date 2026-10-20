@@ -56,34 +56,33 @@ TSV=/tmp/special-files.tsv
 [ -f "$TSV" ]     || { echo "FATAL: $TSV missing (run the Extract step first)" >&2; exit 1; }
 
 echo "=== inject.sh: load raw image ==="
-# podman needs a signature-verification policy to load ANY image; without
-# /etc/containers/policy.json `podman load` dies with
-# "payload does not match any of the supported image formats: ... no policy.json
-# file found" (caught in stage-2, run 39374844906 — the GuixSD image has no
-# /etc/containers because activation never runs; the stage-1 HOST ships one).
-# insecureAcceptAnything is the standard "load without signature checking"
-# policy distros ship; a container executor that loads images must have it.
-# Idempotent: if a policy already exists (stage-1 host) we do not clobber it.
-if [ ! -f /etc/containers/policy.json ]; then
-  mkdir -p /etc/containers
-  printf '%s\n' '{ "default": [{"type": "insecureAcceptAnything"}], "transports": {"docker": {"*": [{"type": "insecureAcceptAnything"}]}, "docker-daemon": {"*": [{"type": "insecureAcceptAnything"}]}} }' > /etc/containers/policy.json
-  echo "wrote /etc/containers/policy.json (insecureAcceptAnything)"
+# These /etc/containers files matter only in the NESTED case — stage 2, where
+# podman runs inside the GuixSD container as root and the image has no
+# /etc/containers (activation never runs). There, missing policy.json breaks
+# `podman load` ("no policy.json file found") and overlay-on-overlayfs breaks
+# the storage driver. On the stage-1 HOST the runner is unprivileged and the
+# system podman already works with its defaults; writing there fails with EACCES
+# (run 39395042104). So provision only when we are root, and otherwise leave the
+# host config untouched.
+if [ "$(id -u)" = "0" ]; then
+  if [ ! -f /etc/containers/policy.json ]; then
+    mkdir -p /etc/containers
+    printf '%s\n' '{ "default": [{"type": "insecureAcceptAnything"}], "transports": {"docker": {"*": [{"type": "insecureAcceptAnything"}]}, "docker-daemon": {"*": [{"type": "insecureAcceptAnything"}]}} }' > /etc/containers/policy.json
+    echo "wrote /etc/containers/policy.json (insecureAcceptAnything)"
+  else
+    echo "/etc/containers/policy.json already present"
+  fi
+  # vfs has no mount_program dependency and works on any backing filesystem; it
+  # copies full layers (heavier on disk) which is fine for one ~3 GB image.
+  if [ ! -f /etc/containers/storage.conf ]; then
+    mkdir -p /etc/containers
+    printf '%s\n' '[storage]' 'driver = "vfs"' 'runroot = "/run/containers/storage"' 'graphroot = "/var/lib/containers/storage"' > /etc/containers/storage.conf
+    echo "wrote /etc/containers/storage.conf (driver=vfs)"
+  else
+    echo "/etc/containers/storage.conf already present: $(grep -m1 driver /etc/containers/storage.conf 2>/dev/null || echo 'no driver line')"
+  fi
 else
-  echo "/etc/containers/policy.json already present"
-fi
-# Nested podman inside a docker container runs on overlayfs, and podman's
-# overlay driver refuses overlay-on-overlayfs ("a mount_program is required",
-# run 39378694600). vfs works anywhere (no mount_program dependency); it copies
-# full layers, which is heavier on disk but correct and deterministic — fine for
-# load/commit/push of a single ~2 GB image. Written here (idempotent) so EVERY
-# podman call in this job (inject, verify, push) uses the same driver; the
-# stage-1 HOST already has a real storage.conf, so it is left untouched.
-if [ ! -f /etc/containers/storage.conf ]; then
-  mkdir -p /etc/containers
-  printf '%s\n' '[storage]' 'driver = "vfs"' 'runroot = "/run/containers/storage"' 'graphroot = "/var/lib/containers/storage"' > /etc/containers/storage.conf
-  echo "wrote /etc/containers/storage.conf (driver=vfs)"
-else
-  echo "/etc/containers/storage.conf already present: $(grep -m1 driver /etc/containers/storage.conf 2>/dev/null || echo 'no driver line')"
+  echo "not root (host build) — keeping the system podman policy/storage"
 fi
 "$PODMAN" load < "$TARBALL"
 
