@@ -9,7 +9,7 @@
 ;;; the workflow never carries a hand-maintained copy of the list — which is
 ;;; what made Verify/Inject cross-file drift possible before.
 ;;;
-;;; Usage:  guix repl executor/gitea/extract-special-files.scm [path/to/config.scm]
+;;; Usage:  guix repl executor/guixsd/extract-special-files.scm [path/to/config.scm]
 ;;; Output: tab-separated rows on stdout; progress/diagnostics on stderr.
 
 (use-modules (gnu)
@@ -21,7 +21,7 @@
 
 ;; Resolve config.scm RELATIVE TO THIS FILE so it works from any cwd. The
 ;; script path must be canonicalized first: a RELATIVE invocation
-;; ("executor/gitea/extract-...") makes dirname return a relative dir, which
+;; ("executor/guixsd/extract-...") makes dirname return a relative dir, which
 ;; load() then resolves against guix repl's own cwd (the script dir) and doubles
 ;; the prefix. Canonicalizing removes the cwd dependency entirely.
 (define here (dirname (canonicalize-path (car (command-line)))))

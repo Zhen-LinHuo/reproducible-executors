@@ -24,7 +24,7 @@ ghcr.io/zhen-linhuo/reproducible-executors/executor-guixsd:v0.2.0
 ghcr.io/zhen-linhuo/reproducible-executors/executor-guixsd:sha-<commit>
 ```
 
-Its toolchain is declared in `executor/gitea/config.scm` and nothing else:
+Its toolchain is declared in `executor/guixsd/config.scm` and nothing else:
 `guix`, `podman`, `python3`, `git`, `git-lfs`, `node`, `bash`, `gcc`
 (libstdc++/libgcc_s for host externals), `guile`, `pkg-config`, `which`,
 `curl`, `wget`.
@@ -47,7 +47,7 @@ boots, so every activation-time artifact is missing: `/bin`, `/lib64`,
 the CA bundle, `/etc/services`). A CI runner starts the container with
 `--entrypoint tail`, so those gaps never fill themselves.
 
-`executor/gitea/inject.sh` therefore runs after `guix system image`: it loads the
+`executor/guixsd/inject.sh` therefore runs after `guix system image`: it loads the
 raw tarball, injects the activation-time files (including the ten `guixbuild`
 users, the CA bundle and `/etc/services`), and commits the result. Both CI
 stages call the **same** script — that is what guarantees the self-built image
@@ -60,11 +60,11 @@ Two workflows:
 | Workflow | Trigger | Runs on | Produces |
 |---|---|---|---|
 | `build-executor-guixsd.yml` | push to `executor/**`, `.guix/**` or itself; after a bootstrap; manual | **inside the executor image** (`container:`, `--privileged`) | the image, rebuilt by itself — this is the regular path |
-| `bootstrap-executor.yml` | **manual only** | GitHub-hosted runner (`ubuntu-latest`), installing Guix from scratch | the image, pushed to GHCR — bootstrap and recovery only |
+| `bootstrap-executor-guixsd.yml` | **manual only** | GitHub-hosted runner (`ubuntu-latest`), installing Guix from scratch | the image, pushed to GHCR — bootstrap and recovery only |
 
 The regular build is the self-bootstrapping one: every change is built inside
 the image that already exists, so the executor is exercised on every push.
-`bootstrap-executor.yml` is needed only for the first build (no image in GHCR
+`bootstrap-executor-guixsd.yml` is needed only for the first build (no image in GHCR
 yet) or to recover from a broken image; a successful bootstrap chains
 `build-executor-guixsd.yml`, which rebuilds the fresh image with itself.
 
@@ -85,20 +85,20 @@ step executes in this environment.
 
 ```bash
 # 1. raw Guix System image
-guix system image -t docker executor/gitea/config.scm > /tmp/executor.tar.gz
+guix system image -t docker executor/guixsd/config.scm > /tmp/executor.tar.gz
 
 # 2. extract the special-files list from config.scm (single source)
-guix repl executor/gitea/extract-special-files.scm > /tmp/special-files.tsv
+guix repl executor/guixsd/extract-special-files.scm > /tmp/special-files.tsv
 
 # 3. inject the activation-time files and commit localhost/guix:latest
-PODMAN=podman bash executor/gitea/inject.sh
+PODMAN=podman bash executor/guixsd/inject.sh
 ```
 
 ## Repository layout
 
 ```
 reproducible-executors/
-├── executor/gitea/
+├── executor/guixsd/
 │   ├── config.scm                  # the whole image, declaratively
 │   ├── manifest.scm                # job toolchain for `guix shell -m`
 │   ├── extract-special-files.scm   # config.scm → TSV (single source)

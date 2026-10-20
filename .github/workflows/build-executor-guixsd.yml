@@ -16,7 +16,7 @@
 # published image is broken: run bootstrap-executor manually, and this workflow
 # re-runs automatically on its success.
 #
-# The bootstrap/recovery counterpart is bootstrap-executor.yml (manual only).
+# The bootstrap/recovery counterpart is bootstrap-executor-guixsd.yml (manual only).
 
 name: build-executor-guixsd
 
@@ -29,7 +29,7 @@ on:
       - '.github/workflows/build-executor-guixsd.yml'
   workflow_run:
     # After a bootstrap or a recovery run, rebuild the fresh image with itself.
-    workflows: [bootstrap-executor]
+    workflows: [bootstrap-executor-guixsd]
     types: [completed]
     branches: [main]
   workflow_dispatch:  # manual rebuild / version bumps
@@ -85,7 +85,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/.cache/guix
-          key: guix-sd-${{ runner.os }}-${{ hashFiles('.guix/channels.scm', 'executor/gitea/config.scm') }}
+          key: guix-sd-${{ runner.os }}-${{ hashFiles('.guix/channels.scm', 'executor/guixsd/config.scm') }}
           restore-keys: |
             guix-sd-${{ runner.os }}-
 
@@ -100,7 +100,7 @@ jobs:
       - name: Start guix-daemon
         run: |
           # === Substitute sources — stage 1's EXACT shape and ORDER ===
-          # (bootstrap-executor.yml "Configure substitute URLs"): bordeaux FIRST
+          # (bootstrap-executor-guixsd.yml "Configure substitute URLs"): bordeaux FIRST
           # (only reliable public farm), the private cache SECOND (optional, secret-
           # driven), then ci.guix + SJTU as fallback.
           # Stage 1 puts this on the DAEMON via a systemd drop-in
@@ -243,7 +243,7 @@ jobs:
             -C .guix/channels.scm \
             --substitute-urls="$SUBS" -- \
             system image -t docker \
-            executor/gitea/config.scm > /tmp/build.log 2>&1
+            executor/guixsd/config.scm > /tmp/build.log 2>&1
           RC=$?
           set -e
           echo "=== build.log tail ==="
@@ -271,18 +271,18 @@ jobs:
       # /run/current-system and /etc (all activation-time). Pushing it as-is
       # ships a BROKEN executor that can't start its own daemon — which is
       # exactly the week of EPERM/SSL/EAI_SERVICE failures. So Extract the
-      # special-files list, then run the SHARED executor/gitea/inject.sh, then
+      # special-files list, then run the SHARED executor/guixsd/inject.sh, then
       # verify the injected image, then push. Same script + same config as
       # stage 1 => the bootstrap image can never be less complete than stage 1's.
       - name: Extract special-files from config.scm (single source)
         run: |
-          /run/current-system/profile/bin/guix repl executor/gitea/extract-special-files.scm > /tmp/special-files.tsv
+          /run/current-system/profile/bin/guix repl executor/guixsd/extract-special-files.scm > /tmp/special-files.tsv
           N=$(grep -vc '^#' /tmp/special-files.tsv || true)
           echo "extracted $N special-files entries"
           [ "$N" -ge 30 ] || { echo "FATAL: extracted only $N entries (expected ~35)" >&2; exit 1; }
 
       - name: Inject special-files and /etc (shared pipeline)
-        # The same executor/gitea/inject.sh stage 1 runs. Stage 2 runs INSIDE
+        # The same executor/guixsd/inject.sh stage 1 runs. Stage 2 runs INSIDE
         # the injected latest image, so tar/bash/grep/dirname are present (/bin
         # symlinks from stage 1's injection); PODMAN is the image's own podman
         # (now baked into config.scm packages). inject.sh does load/tag/commit
@@ -290,7 +290,7 @@ jobs:
         # clone(2) under --privileged.
         run: |
           export PATH=/bin:/run/current-system/profile/bin:$PATH
-          PODMAN=/run/current-system/profile/bin/podman bash executor/gitea/inject.sh
+          PODMAN=/run/current-system/profile/bin/podman bash executor/guixsd/inject.sh
 
       - name: Verify image
         run: |
@@ -362,7 +362,7 @@ jobs:
           SRC="localhost/guix:latest"
           OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           DEST="ghcr.io/${OWNER}/reproducible-executors/executor-guixsd"
-          VERSION="$(cat executor/gitea/VERSION)"
+          VERSION="$(cat executor/guixsd/VERSION)"
           # Three-tag policy: v-semver / latest / sha (traceability).
           "$PODMAN" tag "$SRC" "$DEST:v${VERSION}"
           "$PODMAN" tag "$SRC" "$DEST:latest"

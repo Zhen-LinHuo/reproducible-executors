@@ -13,7 +13,7 @@
 # The fix is to materialise all of it at build time via podman run+exec+commit.
 #
 # This is the SINGLE SOURCE for that pipeline. BOTH stages call it:
-#   - bootstrap-executor.yml    runs on the runner HOST: PODMAN=podman
+#   - bootstrap-executor-guixsd.yml    runs on the runner HOST: PODMAN=podman
 #   - build-executor-guixsd.yml runs INSIDE the executor image (regular path):
 #     PODMAN=/run/current-system/profile/bin/podman
 # Keeping it in one file is what makes the bootstrap faithful: stage 2 cannot

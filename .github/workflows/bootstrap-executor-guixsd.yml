@@ -13,7 +13,7 @@
 #   - Self-hosted runners substitute the private cache first; the
 #     GUIX_CACHE_URL secret carries that URL for workflows that run there.
 
-name: bootstrap-executor
+name: bootstrap-executor-guixsd
 
 # BOOTSTRAP / RECOVERY PATH — manual only.
 #
@@ -58,7 +58,7 @@ jobs:
             ~/.cache/guix
             /var/guix/profiles
             /root/.config/guix
-          key: guix-${{ runner.os }}-${{ hashFiles('.guix/channels.scm', 'executor/gitea/config.scm') }}
+          key: guix-${{ runner.os }}-${{ hashFiles('.guix/channels.scm', 'executor/guixsd/config.scm') }}
           restore-keys: |
             guix-${{ runner.os }}-
 
@@ -199,7 +199,7 @@ jobs:
           set +e
           STORE_PATH=$(guix time-machine -C .guix/channels.scm \
             --substitute-urls="$SUBS" -- \
-            system image -t docker executor/gitea/config.scm \
+            system image -t docker executor/guixsd/config.scm \
             2> >(tee /tmp/guix-build-stderr.log >&2) | tail -1)
           GUIX_RC=${PIPESTATUS[0]}
           set -e
@@ -226,7 +226,7 @@ jobs:
         # The script resolves config.scm relative to its own (canonicalized)
         # location, so it is cwd-independent; verified 35 entries locally.
         run: |
-          guix repl executor/gitea/extract-special-files.scm > /tmp/special-files.tsv
+          guix repl executor/guixsd/extract-special-files.scm > /tmp/special-files.tsv
           N=$(grep -vc '^#' /tmp/special-files.tsv || true)
           echo "extracted $N special-files entries"
           [ "$N" -ge 30 ] || { echo "FATAL: extracted only $N entries (expected ~35)" >&2; exit 1; }
@@ -238,13 +238,13 @@ jobs:
         # The full activation-gap fix (build-time /bin + /lib64 + /run/current-system
         # + /root, then /etc: passwd with the 10 guixbuild users, group, nsswitch,
         # hosts, CA bundle, /etc/services) lives in ONE script shared with the
-        # bootstrap stage — executor/gitea/inject.sh. Single source: the bootstrap
+        # bootstrap stage — executor/guixsd/inject.sh. Single source: the bootstrap
         # image can never drift from (or be less complete than) this one, because
         # both run the identical script against the identical config.scm.
         # This stage runs on the runner HOST, so PODMAN is the host podman.
         # See inject.sh header for the per-step "why" (each gap is annotated there).
         run: |
-          PODMAN=podman bash executor/gitea/inject.sh
+          PODMAN=podman bash executor/guixsd/inject.sh
 
       - name: Verify image
         run: |
@@ -310,7 +310,7 @@ jobs:
           # `podman push` with "repository name must be lowercase".
           OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           DEST="ghcr.io/${OWNER}/reproducible-executors/executor-guixsd"
-          VERSION="$(cat executor/gitea/VERSION)"
+          VERSION="$(cat executor/guixsd/VERSION)"
           # Three-tag policy: v-semver (explicit content version, bumped by
           # editing VERSION), latest (points at the newest vX.Y.Z), and a
           # sha tag for build traceability. No per-CI variants.

@@ -5,7 +5,7 @@
 ;;; `guix shell -m` use); edit BOTH when changing the toolchain.
 ;;;
 ;;; Build:
-;;;   guix system image -t docker executor/gitea/config.scm > executor.tar.gz
+;;;   guix system image -t docker executor/guixsd/config.scm > executor.tar.gz
 ;;;   podman load < executor.tar.gz
 
 (use-modules (gnu) (gnu packages))
