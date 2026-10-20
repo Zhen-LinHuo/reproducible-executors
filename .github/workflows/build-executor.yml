@@ -1,0 +1,322 @@
+# Build the CI job executor image → GHCR.
+#
+# ONE executor image: a Guix System OS + job toolchain (git, .NET, Python,
+# guix, make, curl …). It is NOT a runner — no gitea-runner/act-runner
+# binary inside. A CI system (Gitea Actions / Forgejo / GitHub) runs its
+# runner process elsewhere and executes job steps inside this image, so
+# there are no per-CI variants and no variant tags: one image, one tag.
+#
+# Substitute policy by runner class (this workflow is GitHub-hosted):
+#   - GitHub-hosted runners have no IPv6 egress; a private cache may be IPv6-only,
+#     so a private cache URL there is a connect-timeout per miss, not a
+#     fast fallback (see substitute-cache-garage.md). Use official
+#     substitutes only: ci.guix.gnu.org + bordeaux.
+#   - Self-hosted runners substitute the private cache first; the
+#     GUIX_CACHE_URL secret carries that URL for workflows that run there.
+
+name: build-executor
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'executor/**'
+      - '.guix/**'          # channel pins — changing them changes the build
+      - '.github/workflows/build-executor.yml'
+  workflow_dispatch:  # manual trigger (version bumps, retries)
+
+permissions:
+  contents: read
+  packages: write  # push to GHCR
+
+env:
+  # mkstemp: Permission denied fix — the guix-daemon (root) inherits TMPDIR
+  # from the systemctl environment, which points at the runner-owned temp
+  # dir (/home/runner/work/_temp, mode 0700, owned by runner user). Root can
+  # traverse it but cannot create files there (no w+x for other). Setting
+  # TMPDIR=/tmp at job level propagates to all steps AND to daemon commands
+  # invoked via `systemctl set-environment` or `sudo systemctl` (the install
+  # action's daemon unit does NOT pin TMPDIR, so it inherits this).
+  TMPDIR: /tmp
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore Guix caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/guix
+            /var/guix/profiles
+            /root/.config/guix
+          key: guix-${{ runner.os }}-${{ hashFiles('.guix/channels.scm', 'executor/gitea/config.scm') }}
+          restore-keys: |
+            guix-${{ runner.os }}-
+
+      - name: Install Guix
+        # Inline installer from ftp.gnu.org (200, stable) — PromyLOPh is
+        # hard-coded to ci.guix.gnu.org which is currently 502 on its
+        # /search endpoint (the tarball URL PromyLOPh uses). The 1.5.0
+        # stable tarball installs in ~2-3 min.
+        #
+        # The last three steps of PromyLOPh are REQUIRED, not optional —
+        # dropping them caused the 2h bootstrap rebuild (run 38855918229,
+        # log: "ACL for archive imports seems to be uninitialized, substitutes
+        # may be unavailable"): without --authorize the client refuses EVERY
+        # substitute regardless of source, and without --generate-key the
+        # daemon has no signing keypair. The channel pin is set in
+        # .guix/channels.scm and resolved by `guix time-machine -C` in the
+        # Build step, so no `guix pull` here.
+        run: |
+          URL="https://ftp.gnu.org/gnu/guix/guix-binary-1.5.0.x86_64-linux.tar.xz"
+          echo "downloading $URL"
+          curl -fSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/guix-binary.tar.xz "$URL"
+          sudo -- tar --extract --file /tmp/guix-binary.tar.xz -C / --no-overwrite-dir
+          sudo -- groupadd --system guixbuild 2>/dev/null || true
+          for i in $(seq -w 1 10); do
+            sudo useradd -g guixbuild -G guixbuild -d /var/empty -s "$(which nologin)" -c "Guix build user $i" --system "guixbuilder${i}" 2>/dev/null || true
+          done
+          export GUIX_PATH=/var/guix/profiles/per-user/root/current-guix
+          sudo cp "$GUIX_PATH/lib/systemd/system/gnu-store.mount" /etc/systemd/system/ 2>/dev/null || true
+          cat <<'EOF' > "${{ runner.temp }}/guix-daemon.service"
+          [Unit]
+          Description=Build daemon for GNU Guix
+
+          [Service]
+          ExecStart=GUIX_PATH_PLACEHOLDER/bin/guix-daemon --build-users-group=guixbuild --discover=yes
+          Environment='GUIX_LOCPATH=/var/guix/profiles/per-user/root/guix-profile/lib/locale' LC_ALL=en_US.utf8
+          OOMPolicy=continue
+          Restart=always
+          TasksMax=8192
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          sudo sed -i "s|GUIX_PATH_PLACEHOLDER|$GUIX_PATH|" "${{ runner.temp }}/guix-daemon.service"
+          sudo cp "${{ runner.temp }}/guix-daemon.service" /etc/systemd/system/
+          sudo chmod 664 /etc/systemd/system/guix-daemon.service
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now gnu-store.mount guix-daemon.service 2>/dev/null || sudo systemctl enable --now guix-daemon.service
+          echo "$GUIX_PATH/bin" >> "$GITHUB_PATH"
+          "$GUIX_PATH/bin/guix" --version | head -1
+
+          # === PromyLOPh's "Authorize build farm" + "Generate keys" (restored) ===
+          # 1. Authorize every official substitute-server public key shipped
+          #    in the tarball. Without this the ACL is uninitialized and
+          #    guix-substitute refuses ALL substitutes regardless of source
+          #    (log: "ACL for archive imports seems to be uninitialized") —
+          #    every source then looks like a miss, forcing a source rebuild.
+          for F in "$GUIX_PATH"/share/guix/*.pub; do
+            [ -e "$F" ] || continue
+            echo "authorizing $(basename "$F")"
+            sudo "$GUIX_PATH/bin/guix" archive --authorize < "$F"
+          done
+          # 2. Generate the daemon's signing keypair (PromyLOPh runs this
+          #    unconditionally before the daemon serves anything).
+          sudo "$GUIX_PATH/bin/guix" archive --generate-key
+
+      - name: Configure substitute URLs
+        run: |
+          # Written to a daemon drop-in (the daemon, not this shell, fetches
+          # substitutes).
+          # TMPDIR: root process in daemon cannot mkstemp in runner-owned
+          # /home/runner/work/_temp (mode 0700) — pin /tmp here so daemon
+          # inherits it regardless of caller env (mkstemp: Permission denied).
+          # Substitute sources — LAYERED first-hit, all sources KEPT (for query
+          # and future push). Bordeaux first (only reliable public farm right
+          # now; ci.guix 502, SJTU 000 would cost a timeout per query). Private
+          # private cache kept second — reachable from internal hosts over IPv6, and the
+          # target for future cache populate. Dead sources are only consulted
+          # AFTER bordeaux misses an item.
+          SUBS="https://bordeaux.guix.gnu.org"
+          if [ -n "${{ secrets.GUIX_CACHE_URL }}" ]; then
+            SUBS="$SUBS ${{ secrets.GUIX_CACHE_URL }}"
+          fi
+          SUBS="$SUBS https://ci.guix.gnu.org https://mirror.sjtu.edu.cn/guix/"
+          echo "substitute-urls = $SUBS"
+          sudo mkdir -p /etc/systemd/system/guix-daemon.service.d
+          printf '[Service]\nEnvironment="GUIX_SUBSTITUTE_URLS=%s"\nEnvironment="TMPDIR=/tmp"\n' "$SUBS" | \
+            sudo tee /etc/systemd/system/guix-daemon.service.d/10-substitute.conf > /dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl restart guix-daemon
+          echo "substitute-urls = $SUBS"
+
+          # Our inline installer puts guix under root's profile; add it to the
+          # runner's PATH for subsequent steps via GITHUB_PATH (official mech).
+          echo "/var/guix/profiles/per-user/root/current-guix/bin" >> "$GITHUB_PATH"
+          echo "guix path added to GITHUB_PATH for subsequent steps"
+
+      - name: Diagnose guix environment
+        run: |
+          # Evidence for the NEXT failure, not a guess: where guix actually is,
+          # what PATH looks like, and whether GITHUB_PATH from the prior step
+          # landed (this is what would have saved two debug cycles already).
+          echo "which guix: $(command -v guix || echo NOT-IN-PATH)"
+          echo "GITHUB_PATH (prior step writes): $GITHUB_PATH"
+          echo "PATH entries containing guix:"
+          echo "$PATH" | tr ':' '\n' | grep -i guix || echo "  (none)"
+          ls -d /var/guix/profiles/per-user/root/current-guix/bin/guix 2>/dev/null \
+            && echo "root-profile guix: PRESENT" || echo "root-profile guix: MISSING"
+
+      - name: Build executor image (guix system image)
+        # README:45 原命令 — 完整 OS rootfs（Guix System），closure 含 glibc。
+        # 与 guix pack 的本质区别：pack 是纯 profile（无 glibc store closure 的根布局），
+        # OS 镜像是完整 rootfs（/gnu/store 含全部 closure，但 /bin /lib64 是 activation-time 创建，
+        # 构建时 tar 顶层为空 —— 实测：tar 只有 layer.tar/config.json/manifest.json）。
+        #
+        # GitHub runner 硬编码 --entrypoint tail（不 boot → 不 activation），所以 /bin 必须
+        # 在构建时（Inject 步骤）注入。官方先例：WSL2 image 类型（image.scm:926）在构建期
+        # 创建 /bin/sh，注释写明 "Will be overwritten by system activation"。
+        #
+        # -C .guix/channels.scm pins the channel set.
+        # time-machine only: the inner system image takes no --substitute-urls.
+        # stdout/stderr split so the real build error is never swallowed.
+        run: |
+          # Substitute sources — LAYERED first-hit, all sources KEPT (per design
+          # decision: preserve our caches for query and future push):
+          #   1. bordeaux  — only reliable public farm right now (verified 200).
+          #                  ci.guix is 502, SJTU is 000 — putting them first
+          #                  costs a timeout PER narinfo query.
+          #   2. private cache (GUIX_CACHE_URL) — kept for query on internal
+          #                  runners (IPv6 overlay) and for FUTURE push/populate.
+          #   3. remaining public mirrors — kept as fallback for later.
+          # Guix consults in order and stops at first hit, so a dead source is
+          # only ever consulted AFTER bordeaux misses an item.
+          SUBS="https://bordeaux.guix.gnu.org"
+          if [ -n "${{ secrets.GUIX_CACHE_URL }}" ]; then
+            SUBS="$SUBS ${{ secrets.GUIX_CACHE_URL }}"
+          fi
+          SUBS="$SUBS https://ci.guix.gnu.org https://mirror.sjtu.edu.cn/guix/"
+          set +e
+          STORE_PATH=$(guix time-machine -C .guix/channels.scm \
+            --substitute-urls="$SUBS" -- \
+            system image -t docker executor/gitea/config.scm \
+            2> >(tee /tmp/guix-build-stderr.log >&2) | tail -1)
+          GUIX_RC=${PIPESTATUS[0]}
+          set -e
+          echo "STORE_PATH='$STORE_PATH' (rc=$GUIX_RC)"
+          if [ "$GUIX_RC" -ne 0 ] || [ -z "$STORE_PATH" ]; then
+            echo "=== BUILD FAILED (rc=$GUIX_RC) — full guix stderr ==="
+            cat /tmp/guix-build-stderr.log
+            exit 1
+          fi
+          [ -f "$STORE_PATH" ] || { echo "FATAL: not a file: $STORE_PATH"; cat /tmp/guix-build-stderr.log; exit 1; }
+          case "$STORE_PATH" in
+            *.tar.gz) : ;;
+            *) echo "FATAL: unexpected store item name: $STORE_PATH"; cat /tmp/guix-build-stderr.log; exit 1 ;;
+          esac
+          cp "$STORE_PATH" /tmp/executor.tar.gz
+          ls -lh /tmp/executor.tar.gz
+
+      - name: Extract special-files from config.scm (single source)
+        # config.scm is the ONLY declaration of the build-time links the image
+        # needs (its special-files alist). This step materialises that list as a
+        # TSV so the Inject loop below cannot drift from the config — replacing
+        # the old hand-maintained link list (and the Verify<->Inject cross-check
+        # that existed only to police that drift).
+        # The script resolves config.scm relative to its own (canonicalized)
+        # location, so it is cwd-independent; verified 35 entries locally.
+        run: |
+          guix repl executor/gitea/extract-special-files.scm > /tmp/special-files.tsv
+          N=$(grep -vc '^#' /tmp/special-files.tsv || true)
+          echo "extracted $N special-files entries"
+          [ "$N" -ge 30 ] || { echo "FATAL: extracted only $N entries (expected ~35)" >&2; exit 1; }
+          # spot-check the entries that historically went missing
+          grep -q '^/usr/bin/env' /tmp/special-files.tsv || { echo "FATAL: /usr/bin/env missing from extract" >&2; exit 1; }
+          grep -q '^/bin/tar' /tmp/special-files.tsv || { echo "FATAL: /bin/tar missing from extract" >&2; exit 1; }
+
+      - name: Inject special-files and /etc (shared pipeline)
+        # The full activation-gap fix (build-time /bin + /lib64 + /run/current-system
+        # + /root, then /etc: passwd with the 10 guixbuild users, group, nsswitch,
+        # hosts, CA bundle, /etc/services) lives in ONE script shared with the
+        # bootstrap stage — executor/gitea/inject.sh. Single source: the bootstrap
+        # image can never drift from (or be less complete than) this one, because
+        # both run the identical script against the identical config.scm.
+        # This stage runs on the runner HOST, so PODMAN is the host podman.
+        # See inject.sh header for the per-step "why" (each gap is annotated there).
+        run: |
+          PODMAN=podman bash executor/gitea/inject.sh
+
+      - name: Verify image
+        run: |
+          ls -lh /tmp/executor.tar.gz
+          # guix system image -t docker 输出 gzipped tarball（Docker Spec）。
+          gzip -t /tmp/executor.tar.gz
+          # Inject 步骤已 commit 到 localhost/guix:latest — 这里验证注入结果。
+          # OS 镜像 /bin 是 Inject 的 symlink（指向 store），/lib64/ld-linux 也在。
+          podman run -d --name exec-smoke --entrypoint tail localhost/guix:latest -f /dev/null
+          sleep 2
+          CID=$(podman inspect --format '{{.State.Running}}' exec-smoke 2>/dev/null || echo dead)
+          [ "$CID" = "true" ] || { echo "FATAL: smoke container not running"; podman logs exec-smoke; podman rm -f exec-smoke; exit 1; }
+          # GitHub Actions container contract: --entrypoint tail -f /dev/null.
+          podman exec exec-smoke /bin/tail --version | head -1
+          # runner OS 探测: sh -c "cat /etc/*release"
+          podman exec exec-smoke /bin/sh -c 'echo sh-works'
+          # JS action runtime
+          podman exec exec-smoke /bin/node --version
+          # Job toolchain (all via /bin symlinks → store)
+          for T in grep sed awk find tar gzip which; do
+            podman exec exec-smoke "/bin/$T" --version 2>/dev/null | head -1 || podman exec exec-smoke "/bin/$T" -V 2>/dev/null | head -1 || echo "$T: (no --version flag)"
+          done
+          # /lib64/ld-linux 存在（宿主 node exec 前提）
+          podman exec exec-smoke /bin/sh -c 'test -e /lib64/ld-linux-x86-64.so.2 && echo "ld-linux: OK"'
+          # /run/current-system/profile 必须可执行 guix（自举 workflow 的 13 处依赖）
+          # 注意：test 是 shell 内建，没有 /bin/test 二进制 → 必须经 /bin/sh -c 调用。
+          podman exec exec-smoke /bin/ls -la /run/current-system/profile 2>&1 \
+            && podman exec exec-smoke /bin/sh -c 'test -x /run/current-system/profile/bin/guix' \
+            && echo "run/current-system/profile/bin/guix: OK" \
+            || { echo "FATAL: /run/current-system/profile missing — bootstrap will fail"; podman rm -f exec-smoke; exit 1; }
+          # 图像 ENV 必须带 LD_LIBRARY_PATH（Guix loader 不搜 /lib64，只认它 + store lib/）
+          podman inspect localhost/guix:latest --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -q LD_LIBRARY_PATH \
+            && echo "LD_LIBRARY_PATH in image ENV: OK" \
+            || { echo "FATAL: image ENV lacks LD_LIBRARY_PATH — runner externals node will fail"; podman rm -f exec-smoke; exit 1; }
+          # === 真实回归：把 runner 自己的 externals node（报错的那个二进制）放进容器执行 ===
+          # 这就是 /__e/node24/bin/node —— 之前失败的精确复现，Verify 在推 GHCR 之前拦截坏镜像
+          EXT=$(ls -d /home/runner/actions-runner/cached/*/externals 2>/dev/null | head -1)
+          if [ -n "$EXT" ]; then
+            podman cp "$EXT" exec-smoke:/tmp/__e
+            echo "--- host externals node inside container (exact CI failure binary) ---"
+            podman exec exec-smoke /tmp/__e/node24/bin/node --version \
+              || { echo "FATAL: externals node failed to run — same as bootstrap failure"; podman rm -f exec-smoke; exit 1; }
+            echo "externals node: OK"
+          else
+            echo "WARN: externals path not found on host — skipped real-node test"
+          fi
+          podman stop exec-smoke && podman rm exec-smoke
+          echo "=== executor image verified (OS + injected /bin + /lib64 + LD_LIBRARY_PATH) ==="
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and push to GHCR
+        run: |
+          # guix system image -t docker tags the image as `guix:latest` by default.
+          SRC="localhost/guix:latest"
+          # OCI requires ALL-LOWERCASE repository paths; the GitHub owner
+          # (Zhen-LinHuo) carries capitals and is rejected verbatim by
+          # `podman push` with "repository name must be lowercase".
+          OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          DEST="ghcr.io/${OWNER}/reproducible-executors/executor-guixsd"
+          VERSION="$(cat executor/gitea/VERSION)"
+          # Three-tag policy: v-semver (explicit content version, bumped by
+          # editing VERSION), latest (points at the newest vX.Y.Z), and a
+          # sha tag for build traceability. No per-CI variants.
+          podman tag "$SRC" "$DEST:v${VERSION}"
+          podman tag "$SRC" "$DEST:latest"
+          podman tag "$SRC" "$DEST:sha-${GITHUB_SHA:0:12}"
+          podman push "$DEST:v${VERSION}"
+          podman push "$DEST:latest"
+          podman push "$DEST:sha-${GITHUB_SHA:0:12}"
+
+      - name: Image metadata
+        run: |
+          podman inspect "ghcr.io/$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')/reproducible-executors/executor-guixsd:latest" \
+            --format '{{.Size}} bytes'
