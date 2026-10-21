@@ -21,11 +21,11 @@ Concise, present-tense, forward-looking. State rules, not history.
 
 ## Principles
 
-- **Declarative first** — All system configuration lives in `executor/guixsd/config.scm` and `manifest.scm`. Imperative steps belong in CI workflow steps or in `inject.sh`, and only where unavoidable.
-- **The image is produced in two stages** — `guix system image -t docker` exports a *raw* tarball; `inject.sh` then writes the activation-time files (`/bin`, `/lib64`, `/run/current-system`, `/root`, `/etc`) and commits. Never publish the raw tarball: without the injection it has no `/bin`, no `/etc` and no build users.
+- **Declarative first** — All system configuration lives in `executor/guixsd/config.scm` and `manifest.scm`. Imperative steps belong in CI workflow steps or in `inject.py`, and only where unavoidable.
+- **The image is produced in two stages** — `guix system image -t docker` exports a *raw* tarball; `inject.py` then writes the activation-time files (`/bin`, `/lib64`, `/run/current-system`, `/root`, `/etc`) into the layer tar and regenerates `config.json` — deterministically, with no `podman commit`. Never publish the raw tarball: without the injection it has no `/bin`, no `/etc` and no build users.
 - **Reproducibility over convenience** — Pin the channel commit, keep the channel introduction verbatim from upstream, verify rebuilds are bit-identical.
 - **Fat executor, stateless runner** — The executor carries `guix`, `podman`, `python3`, `git`, `node`, `bash` and build tools; the runner stays thin.
-- **Verification: run the change, don't describe it** — Before declaring work done, build the image, run `inject.sh`, and boot the result to probe the toolchain, the build users, the CA bundle and `/etc/services`.
+- **Verification: run the change, don't describe it** — Before declaring work done, build the image, run `inject.py`, and boot the result to probe the toolchain, the build users, the CA bundle and `/etc/services`.
 
 ## Completion discipline
 
@@ -34,5 +34,5 @@ Before declaring work done:
 - Check the change's blast radius (the image is used by both CI stages and by the deployment containers)
 - Update every affected project document — README, this file, VERSION
 - Verify the image builds successfully (or explain why it can't be verified)
-- Confirm `guix system image -t docker executor/guixsd/config.scm` completes without errors, and that `inject.sh` finishes cleanly
+- Confirm `guix system image -t docker executor/guixsd/config.scm` completes without errors, and that `inject.py` finishes cleanly
 - Confirm the self-bootstrapping workflow still passes: the image must be able to rebuild itself

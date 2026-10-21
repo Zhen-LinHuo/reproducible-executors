@@ -238,13 +238,19 @@ jobs:
         # The full activation-gap fix (build-time /bin + /lib64 + /run/current-system
         # + /root, then /etc: passwd with the 10 guixbuild users, group, nsswitch,
         # hosts, CA bundle, /etc/services) lives in ONE script shared with the
-        # bootstrap stage — executor/guixsd/inject.sh. Single source: the bootstrap
+        # bootstrap stage — executor/guixsd/inject.py. Single source: the bootstrap
         # image can never drift from (or be less complete than) this one, because
         # both run the identical script against the identical config.scm.
         # This stage runs on the runner HOST, so PODMAN is the host podman.
-        # See inject.sh header for the per-step "why" (each gap is annotated there).
+        # See inject.py header for the per-step "why" (each gap is annotated there).
         run: |
-          PODMAN=podman bash executor/guixsd/inject.sh
+          # Deterministic tar-level injection. NOT podman load/commit: commit
+          # stamps `created` with the wall clock, merges Env in map order and
+          # rewrites file mtimes, so every build produced a different digest.
+          # guix's own output is already reproducible (created=1970, mtimes=0);
+          # inject.py preserves that.
+          python3 executor/guixsd/inject.py /tmp/executor.tar.gz /tmp/executor-injected.tar /tmp/special-files.tsv
+          podman load < /tmp/executor-injected.tar
 
       - name: Verify image
         run: |

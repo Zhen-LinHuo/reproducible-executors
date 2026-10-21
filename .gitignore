@@ -25,3 +25,7 @@ Thumbs.db
 
 # Agent local instructions (sensitive — never published)
 AGENTS.local.md
+
+# Python
+__pycache__/
+*.pyc

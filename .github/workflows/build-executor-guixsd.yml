@@ -271,7 +271,7 @@ jobs:
       # /run/current-system and /etc (all activation-time). Pushing it as-is
       # ships a BROKEN executor that can't start its own daemon — which is
       # exactly the week of EPERM/SSL/EAI_SERVICE failures. So Extract the
-      # special-files list, then run the SHARED executor/guixsd/inject.sh, then
+      # special-files list, then run the SHARED executor/guixsd/inject.py, then
       # verify the injected image, then push. Same script + same config as
       # stage 1 => the bootstrap image can never be less complete than stage 1's.
       - name: Extract special-files from config.scm (single source)
@@ -282,22 +282,23 @@ jobs:
           [ "$N" -ge 30 ] || { echo "FATAL: extracted only $N entries (expected ~35)" >&2; exit 1; }
 
       - name: Inject special-files and /etc (shared pipeline)
-        # The same executor/guixsd/inject.sh stage 1 runs. Stage 2 runs INSIDE
+        # The same executor/guixsd/inject.py stage 1 runs. Stage 2 runs INSIDE
         # the injected latest image, so tar/bash/grep/dirname are present (/bin
         # symlinks from stage 1's injection); PODMAN is the image's own podman
-        # (now baked into config.scm packages). inject.sh does load/tag/commit
-        # only — the nested operation set the daemon already proved works with
-        # clone(2) under --privileged.
+        # (now baked into config.scm packages). inject.py only rewrites the
+        # layer tar; podman is then used solely to load the finished archive.
         run: |
           export PATH=/bin:/run/current-system/profile/bin:$PATH
-          PODMAN=/run/current-system/profile/bin/podman bash executor/guixsd/inject.sh
+          # Same deterministic tar-level injection as stage 1 (no podman commit).
+          python3 executor/guixsd/inject.py /tmp/executor.tar.gz /tmp/executor-injected.tar /tmp/special-files.tsv
+          /run/current-system/profile/bin/podman load < /tmp/executor-injected.tar
 
       - name: Verify image
         run: |
           # Two layers of proof: (1) the raw guix artifact is a well-formed
           # docker image (gzip + manifest + size — a cheap guard against a
           # truncated time-machine build before we trust anything), then (2) the
-          # injection inject.sh just performed is really present (boot the image
+          # injection inject.py just performed is really present (boot the image
           # and probe /bin/tail, the OS profile, the 10 build users, the CA
           # bundle, /etc/services). podman ships in the image now (config.scm).
           ls -lh /tmp/executor.tar.gz
@@ -318,7 +319,8 @@ jobs:
             echo "FATAL: image suspiciously small ($SZ bytes)"; exit 1
           fi
           echo "size check: OK ($SZ bytes)"
-          # inject.sh already loaded + committed localhost/guix:latest (injected).
+          # inject.py produced the injected archive and it is loaded as
+          # localhost/guix:latest.
           # Do NOT re-load the raw tarball here — that would clobber the injection
           # and push a broken image. Assert the injection is present instead.
           PODMAN=/run/current-system/profile/bin/podman
@@ -326,7 +328,7 @@ jobs:
           "$PODMAN" inspect localhost/guix:latest --format '{{range .Config.Env}}{{println .}}{{end}}' \
             | grep -q LD_LIBRARY_PATH \
             && echo "LD_LIBRARY_PATH in image ENV: OK" \
-            || { echo "FATAL: image ENV lacks LD_LIBRARY_PATH — inject.sh did not commit?"; exit 1; }
+            || { echo "FATAL: image ENV lacks LD_LIBRARY_PATH — inject.py did not run?"; exit 1; }
           # Boot the injected image (nested container under --privileged — the
           # same namespace clone the daemon proved works) and probe real files.
           "$PODMAN" rm -f bsmoke 2>/dev/null || true

@@ -47,11 +47,29 @@ boots, so every activation-time artifact is missing: `/bin`, `/lib64`,
 the CA bundle, `/etc/services`). A CI runner starts the container with
 `--entrypoint tail`, so those gaps never fill themselves.
 
-`executor/guixsd/inject.sh` therefore runs after `guix system image`: it loads the
-raw tarball, injects the activation-time files (including the ten `guixbuild`
-users, the CA bundle and `/etc/services`), and commits the result. Both CI
-stages call the **same** script — that is what guarantees the self-built image
-is never less complete than the original.
+`executor/guixsd/inject.py` therefore runs after `guix system image`. It
+rewrites the image's layer tar directly, adding the activation-time files
+(including the ten `guixbuild` users, the CA bundle and `/etc/services`) and
+regenerating `config.json`. Both CI stages call the **same** script — that is
+what guarantees the self-built image is never less complete than the original.
+
+The injection deliberately happens at the tar level rather than through
+`podman commit`: `guix system image` is already reproducible (its `created` is
+1970-01-01, its file mtimes are the epoch), while `podman commit` stamps the
+wall clock, merges `Env` in map order and rewrites mtimes — so every build used
+to produce a different digest. `inject.py` keeps the archive deterministic: sorted
+entries, fixed mtime, numeric root ownership and a fixed `Env` order.
+
+## Reproducibility
+
+The same `config.scm` built twice produces the **identical image archive**: the
+script is deterministic given the same inputs, and its output does not depend on
+the wall clock, the build user, or the host.
+
+This covers the packaging the pipeline controls. It cannot make a Guix package
+that is itself unreproducible, and a package substituted on one run but built
+locally on another can still differ — pin the channels and keep the substitute
+farms healthy if you need that guarantee.
 
 ## CI
 
@@ -90,8 +108,12 @@ guix system image -t docker executor/guixsd/config.scm > /tmp/executor.tar.gz
 # 2. extract the special-files list from config.scm (single source)
 guix repl executor/guixsd/extract-special-files.scm > /tmp/special-files.tsv
 
-# 3. inject the activation-time files and commit localhost/guix:latest
-PODMAN=podman bash executor/guixsd/inject.sh
+# 3. inject the activation-time files (deterministic; rewrites the layer tar)
+python3 executor/guixsd/inject.py /tmp/executor.tar.gz /tmp/executor-injected.tar /tmp/special-files.tsv
+
+# 4. load and probe it
+podman load < /tmp/executor-injected.tar
+podman run --rm --entrypoint /run/current-system/profile/bin/guix localhost/guix:latest --version
 ```
 
 ## Repository layout
@@ -102,7 +124,7 @@ reproducible-executors/
 │   ├── config.scm                  # the whole image, declaratively
 │   ├── manifest.scm                # job toolchain for `guix shell -m`
 │   ├── extract-special-files.scm   # config.scm → TSV (single source)
-│   ├── inject.sh                   # raw tarball → runnable image
+│   ├── inject.py                   # raw tarball → runnable image (deterministic)
 │   └── VERSION                     # image version
 ├── .guix/channels.scm              # pinned Guix channel + introduction
 ├── .github/workflows/
