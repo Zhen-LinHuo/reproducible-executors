@@ -71,6 +71,14 @@ that is itself unreproducible, and a package substituted on one run but built
 locally on another can still differ — pin the channels and keep the substitute
 farms healthy if you need that guarantee.
 
+To check it after a change, rebuild without touching `config.scm` or
+`.guix/channels.scm` and compare what the registry reports:
+
+```bash
+gh workflow run build-executor-guixsd.yml --ref main
+# then compare docker-content-digest for the tag across both runs
+```
+
 ## CI
 
 Two workflows:
