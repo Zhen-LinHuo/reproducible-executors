@@ -209,7 +209,29 @@ def symlink(target: str, path: str) -> None:
     os.symlink(target, path)
 
 
+def emit_runtime_config(target_dir: str) -> None:
+    """Write the podman runtime config the BUILD HOST needs to load the image.
+
+    The image itself carries these files (written below), but the container
+    running the build is the previous image, which may predate them. Same
+    constants, so there is still one source for the contents.
+    """
+    os.makedirs(target_dir, exist_ok=True)
+    for name, body in (("policy.json", CONTAINERS_POLICY),
+                       ("storage.conf", STORAGE_CONF)):
+        path = os.path.join(target_dir, name)
+        if os.path.exists(path):
+            print("  keep existing %s" % path)
+            continue
+        with open(path, "w") as f:
+            f.write(body)
+        print("  wrote %s" % path)
+
+
 def main() -> None:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--emit-runtime-config":
+        emit_runtime_config(sys.argv[2])
+        return
     if len(sys.argv) < 3:
         die("usage: inject.py <raw-image.tar[.gz]> <out.tar> [special-files.tsv]")
     src, out = sys.argv[1], sys.argv[2]

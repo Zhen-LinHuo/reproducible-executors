@@ -291,6 +291,11 @@ jobs:
           export PATH=/bin:/run/current-system/profile/bin:$PATH
           # Same deterministic tar-level injection as stage 1 (no podman commit).
           python3 executor/guixsd/inject.py /tmp/executor.tar.gz /tmp/executor-injected.tar /tmp/special-files.tsv
+          # The image being built carries these files, but the image RUNNING the
+          # build is the previous release, which may predate them. podman load
+          # refuses to touch an archive without a policy. Same constants, so the
+          # contents still have exactly one source.
+          python3 executor/guixsd/inject.py --emit-runtime-config /etc/containers
           /run/current-system/profile/bin/podman load < /tmp/executor-injected.tar
 
       - name: Verify image
