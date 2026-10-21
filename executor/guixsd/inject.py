@@ -83,7 +83,17 @@ def die(msg: str) -> None:
 
 
 def run(cmd, **kw):
-    return subprocess.run(cmd, check=True, **kw)
+    try:
+        return subprocess.run(cmd, check=True, **kw)
+    except subprocess.CalledProcessError as e:
+        # Surface the child's stderr instead of dying with a bare traceback.
+        err = e.stderr
+        if isinstance(err, bytes):
+            err = err.decode("utf-8", "replace")
+        if err:
+            print(err.strip(), file=sys.stderr)
+        print("FATAL: command failed (%d): %s" % (e.returncode, " ".join(cmd)), file=sys.stderr)
+        raise SystemExit(1)
 
 
 def sha256_file(path: str) -> str:
@@ -94,8 +104,25 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def read_tar_member(archive: str, member: str, dest: str) -> None:
-    run(["tar", "-xOf", archive, member], stdout=open(dest, "wb"))
+def read_tar_member(archive: str, member: str, dest: str) -> str:
+    """Extract one member; returns the member name that actually matched."""
+    with open(dest, "wb") as out:
+        run(["tar", "-xOf", archive, member], stdout=out)
+    return member
+
+
+def outer_entries(archive: str) -> list[str]:
+    """List the archive's top-level members."""
+    return run(["tar", "-tf", archive], capture_output=True, text=True).stdout.splitlines()
+
+
+def pick_member(entries: list[str], suffix: str) -> str:
+    """Find a member by suffix. guix writes './manifest.json' while a plain
+    docker save writes 'manifest.json' — matching by suffix covers both."""
+    for e in entries:
+        if e.rstrip("/").endswith(suffix):
+            return e
+    return None
 
 
 def _stream(archive: str, member: str):
@@ -197,12 +224,24 @@ def main() -> None:
     os.makedirs(root)
 
     print("=== inject.py: unpack %s ===" % src)
+    entries = outer_entries(src)
+    man_member = pick_member(entries, "manifest.json")
+    cfg_member = pick_member(entries, "config.json")
+    if man_member is None or cfg_member is None:
+        die("no manifest.json/config.json in %s (entries: %s)" % (src, entries[:6]))
+    print("  manifest: %s" % man_member)
     manifest = json.loads(
-        run(["tar", "-xOf", src, "manifest.json"], capture_output=True, text=True).stdout
+        run(["tar", "-xOf", src, man_member], capture_output=True, text=True).stdout
     )
     layer_member = manifest[0]["Layers"][0]
+    if layer_member not in entries:
+        # manifest paths may omit the './' the tar actually carries
+        alt = [e for e in entries if e.rstrip("/").endswith(layer_member.lstrip("./"))]
+        if not alt:
+            die("layer %r not in archive" % layer_member)
+        layer_member = alt[0]
     cfg_path = os.path.join(work, "config.json")
-    read_tar_member(src, manifest[0]["Config"], cfg_path)
+    read_tar_member(src, cfg_member, cfg_path)
 
     listing = list_layer(src, layer_member)
     print("  layer entries: %d" % len(listing))
