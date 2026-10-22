@@ -4,7 +4,7 @@
 
 This repository builds one reproducible CI **job executor** image (NOT a runner) from a declarative Guix System configuration. The agent may:
 
-- Edit `executor/guixsd/config.scm`, `executor/guixsd/manifest.scm`, `executor/guixsd/inject.sh`, `.guix/channels.scm`, and workflow YAML files
+- Edit `executor/guixsd/config.scm`, `executor/guixsd/manifest.scm`, `executor/guixsd/inject.py`, `.guix/channels.scm`, and workflow YAML files
 - Build and test the image locally (podman or docker)
 - Push the executor image to GHCR through CI
 - Update the pinned channel commit
